@@ -1,0 +1,61 @@
+# P0-2 / P3-7: both arms of CM-Reg-Bench on one MSRS subset -- the OpenCV classical floor and
+# the `vismatch` learned arm, scored through the same evaluation path on the same 20 pairs.
+#
+# This is the cell that proves the P0-2 adapter works end to end, and it is deliberately *one*
+# config rather than two: a comparison across two runs would differ in the pairs drawn, and
+# "RoMa beats SIFT" would then be a statement about two subsets rather than about two
+# matchers. Everything except `match.matchers` matches `p3_msrs_classical.yaml`.
+#
+# `limit: 20` because this runs on the Mac dev box on CPU, where RoMa is ~20 s/pair. It is a
+# smoke cell: the numbers sanity-check the plumbing, they are not a benchmark row. A real P3-7
+# run drops the limit, widens the matcher list, and executes on the server.
+runtime:
+  device: cpu
+  name: p3_msrs_arms
+  path: runs/p3_msrs_arms
+  wandb: false
+  wandb_project: cmreg-bench
+  group: p3_msrs_arms_s0
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  limit: 20
+
+gt:
+  seed: 0
+  moving: thermal
+  rotation_deg: 30.0
+  scale_min: 0.8
+  scale_max: 1.25
+  perspective: 0.05
+  translation: 0.05
+
+preprocess:
+  reference: invert          # the PLAN.md §15B recipe: invert the optical grayscale
+  moving: percentile         # ... and percentile-normalise the thermal
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1         # MSRS ships both modalities at one resolution
+  moving_interpolation: bicubic
+
+match:
+  # Ordered cheapest-first so a failure surfaces in seconds rather than after RoMa.
+  # `max_keypoints` is honoured by the OpenCV arm, xfeat and the LightGlue family only -- the
+  # detector-free entries set their own match count (`matchers/vismatch_backend.py`).
+  matchers: [sift, orb, xfeat, superpoint-lightglue, tiny-roma, eloftr, roma]
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
+
+eval:
+  thresholds_px: [3.0, 5.0, 10.0]
+  domain: driving
+  platform: public

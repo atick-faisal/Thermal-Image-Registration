@@ -165,14 +165,22 @@ def render_comparison(summaries: Sequence[Summary], keys: Sequence[str]) -> str:
     """A matcher-per-row table across a chosen metric subset, for multi-matcher runs."""
     if not summaries:
         raise ReportError("cannot compare zero summaries")
-    header = f"{'matcher':<16}" + "".join(f"{key.split('/')[-1]:>{_COLUMN_WIDTH}}" for key in keys)
+    # Widened to the longest name present rather than fixed: `matchanything-eloftr` is 20
+    # characters and a fixed 16 pushes its row one column out of alignment, which is exactly
+    # the kind of damage a copy-pasted block cannot survive -- this table is how results reach
+    # the Mac from the training server, so it has to stay readable as plain text.
+    names = [str(summary.context["matcher"]) for summary in summaries]
+    name_width = max(len("matcher"), *(len(name) for name in names)) + 2
+    header = f"{'matcher':<{name_width}}" + "".join(
+        f"{key.split('/')[-1]:>{_COLUMN_WIDTH}}" for key in keys
+    )
     rule = "-" * len(header)
     lines = ["=== CMREG COMPARISON ===", header, rule]
-    for summary in summaries:
+    for name, summary in zip(names, summaries, strict=True):
         cells = "".join(
             f"{_format(key, summary.metrics.get(key, float('nan'))):>{_COLUMN_WIDTH}}"
             for key in keys
         )
-        lines.append(f"{summary.context['matcher']:<16}{cells}")
+        lines.append(f"{name:<{name_width}}{cells}")
     lines.append("=== END ===")
     return "\n".join(lines)

@@ -16,6 +16,7 @@ suppresses; forcing it away would hide the measurement and cost throughput.
 
 from __future__ import annotations
 
+import hashlib
 import random
 
 import numpy as np
@@ -50,3 +51,32 @@ def seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def cell_seed(seed: int, index: int, matcher: str) -> int:
+    """The seed for one ``(pair, matcher)`` evaluation cell.
+
+    Hashed over all three inputs rather than derived arithmetically like
+    ``gt/synthetic.py::warp_seed``, because one of them is a string. The property that matters
+    is the same one: **a cell's result must depend only on the cell.**
+    """
+    digest = hashlib.sha256(f"{seed}:{index}:{matcher}".encode()).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
+def seed_cell(seed: int, index: int, matcher: str) -> None:
+    """Reseed every RNG before one evaluation cell runs.
+
+    Measured, not assumed: RoMa samples its correspondences with ``torch.multinomial``
+    (``romatch``'s ``sample``), so with an unseeded ambient stream two runs of an identical
+    config over identical pairs gave ``reg/mace`` 121.2 and 43.7 on the same eight MSRS pairs
+    -- a factor of three, from nothing but RNG state. Recorded in TASKS.md P0-2.
+
+    Seeding once per *run* would not be enough. The loop is pairs-outer/matchers-inner, so
+    every matcher consumes from the stream the next one draws from: RoMa's number would then
+    depend on which other matchers shared its config file, and the P3-7 grid would disagree
+    with a single-matcher rerun of the same cell. Keying on ``(seed, index, matcher)`` makes
+    the row reproducible in isolation, which is what the results store's one-row-per-cell
+    model already claims.
+    """
+    seed_everything(cell_seed(seed, index, matcher))

@@ -15,12 +15,20 @@ before writing anything that looks like it might already exist.
 One `uv.lock` serves both machines. Pick exactly one extra:
 
 ```sh
-uv sync --extra cpu    # Mac dev box
-uv sync --extra gpu    # CUDA 13 training server
+uv sync --extra cpu --extra matchers    # Mac dev box
+uv sync --extra gpu --extra matchers    # CUDA 13 training server
 ```
 
-The two extras are declared as `conflicts` so uv resolves them from the same lockfile
-against different PyTorch indices. Syncing without an extra leaves torch unresolved.
+`cpu` and `gpu` are declared as `conflicts` so uv resolves them from the same lockfile
+against different PyTorch indices. Syncing without one of them leaves torch unresolved.
+
+`matchers` is orthogonal to both and pulls in [`vismatch`][vismatch], which is the learned
+arm of the benchmark — RoMa, MINIMA, MatchAnything, LoFTR, LightGlue and the rest. It is
+optional because its transitive tree is large and the registry is built to tolerate its
+absence: sync without it and `cmreg matchers` reports the OpenCV arm alone, with a warning,
+rather than failing to import.
+
+[vismatch]: https://github.com/gmberton/vismatch
 
 ## Use
 
@@ -31,6 +39,11 @@ uv run cmreg gt     -c experiments/smoke.yaml      # Tier-1 dense synthetic-warp
 uv run cmreg bench  -c experiments/p3_msrs_classical.yaml   # one benchmark cell
 uv run cmreg report runs/p3_msrs_classical         # re-render the result block
 ```
+
+`cmreg bench` resolves `runtime.device` (`auto` → `cuda` / `mps` / `cpu`) once and logs it.
+An explicit `cuda` on a machine without CUDA raises rather than falling back — a benchmark
+cell budgeted for the A100s that quietly ran overnight on CPU produces a runtime table
+nobody can interpret.
 
 ### Getting results off the training server
 

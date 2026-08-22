@@ -171,3 +171,78 @@ def test_an_empty_split_fails_loudly(tmp_path: Path) -> None:
     )
     with pytest.raises(RunnerError, match="no images"):
         run_benchmark(base_config(root / "data.yaml", tmp_path / "run"))
+
+
+def _scientific(metrics: dict[str, float]) -> dict[str, float]:
+    """Everything but wall-clock. `time/*` varies run to run by definition and comparing it
+    would make a determinism test a flaky benchmark of the machine it runs on."""
+    return {key: value for key, value in metrics.items() if not key.startswith("time/")}
+
+
+def _register_stochastic_matcher(name: str) -> None:
+    """A matcher that draws its correspondences from torch's ambient RNG.
+
+    Stands in for RoMa, whose ``sample`` uses ``torch.multinomial``. The real thing needs
+    weights and a network; the property under test is the runner's seeding contract, not the
+    matcher, so a two-line stand-in tests it in milliseconds instead of minutes.
+    """
+    import torch
+
+    from cmreg.matchers import MatchResult, register
+
+    class _Stochastic:
+        def __init__(self, config, device) -> None:
+            del config, device
+
+        @property
+        def name(self) -> str:
+            return name
+
+        def __call__(self, image0, image1) -> MatchResult:
+            height, width = image0.shape
+            picks = torch.rand(64, 2) * torch.tensor([width - 1.0, height - 1.0])
+            kpts = picks.numpy().astype(np.float64)
+            return MatchResult(
+                kpts0=kpts,
+                kpts1=kpts,
+                confidence=None,
+                n_detected0=None,
+                n_detected1=None,
+                extract_ms=0.0,
+                match_ms=0.0,
+            )
+
+    register(name, _Stochastic)
+
+
+def test_a_stochastic_matcher_gives_the_same_rows_on_every_run(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """Regression pin for the P0-2 finding: with nothing seeding torch, two runs of an
+    identical config over identical pairs gave ``reg/mace`` 121.2 and 43.7 on the same eight
+    MSRS pairs. Dense matchers sample their correspondences, so an ambient RNG makes the whole
+    benchmark unreproducible for exactly the matchers the project is about."""
+    _register_stochastic_matcher("_stochastic_repeat")
+    manifest = aligned_dataset / "data.yaml"
+    kwargs = {"match": {"matchers": ["_stochastic_repeat"]}}
+    first = run_benchmark(base_config(manifest, tmp_path / "a", **kwargs))[0]
+    second = run_benchmark(base_config(manifest, tmp_path / "b", **kwargs))[0]
+    assert _scientific(first.metrics) == _scientific(second.metrics)
+
+
+def test_a_cell_does_not_depend_on_which_matchers_share_its_config(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The loop is pairs-outer/matchers-inner, so a single per-run seed would leave each
+    matcher drawing from whatever the previous one left behind -- and RoMa's number in the
+    P3-7 grid would disagree with a single-matcher rerun of the same cell. `seed_cell` keys on
+    ``(seed, index, matcher)`` precisely so the results store's one-row-per-cell model holds."""
+    _register_stochastic_matcher("_stochastic_alone")
+    manifest = aligned_dataset / "data.yaml"
+    alone = run_benchmark(
+        base_config(manifest, tmp_path / "alone", match={"matchers": ["_stochastic_alone"]})
+    )[0]
+    _, accompanied = run_benchmark(
+        base_config(manifest, tmp_path / "with", match={"matchers": ["sift", "_stochastic_alone"]})
+    )
+    assert _scientific(accompanied.metrics) == _scientific(alone.metrics)

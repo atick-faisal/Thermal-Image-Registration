@@ -77,8 +77,12 @@ class PairRow:
     corner_err: float | None
     epe_mean: float | None
     epe_median: float | None
-    n_detected_ref: int
-    n_detected_mov: int
+    # Null when the matcher reports no detection count: a dense matcher has no detection
+    # stage, and `vismatch`'s interface cannot tell that apart from a detector that fired on
+    # nothing (`matchers/vismatch_backend.py::_detected`). `0` therefore keeps meaning
+    # "looked and found nothing", which is the distinction the column exists for.
+    n_detected_ref: int | None
+    n_detected_mov: int | None
     n_matches: int
     n_inliers: int
     inlier_ratio: float
@@ -93,6 +97,7 @@ _ARROW_TYPES: dict[str, pa.DataType] = {
     "str": pa.string(),
     "str | None": pa.string(),
     "int": pa.int64(),
+    "int | None": pa.int64(),
     "float": pa.float64(),
     "float | None": pa.float64(),
     "bool": pa.bool_(),

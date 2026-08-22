@@ -47,6 +47,20 @@ gpu = [
     "torch>=2.12.1,<2.13.0",
     "torchvision>=0.27.1,<0.28.0",
 ]
+# The learned-matcher arm (TASKS.md P0-2, PLAN.md 15A). Optional rather than a core
+# dependency because its transitive tree is heavy -- kornia, lightning, uniception, e2cnn,
+# trimesh, tensorboard, poselib -- and `matchers/base.py`'s registry was built from the start
+# to tolerate an absent backend. Deliberately NOT in `[tool.uv] conflicts`: it is orthogonal
+# to cpu/gpu, so `--extra cpu --extra matchers` is the intended Mac invocation.
+#
+# Failure mode: syncing without it leaves the benchmark with the OpenCV arm only, and every
+# Phase-3 table silently reports two matchers instead of twenty.
+matchers = [
+    # 1.2.0's own metadata declares `requires-python == "3.11.*"` in the git clone, but the
+    # PyPI release resolves cleanly under ==3.12.* (verified in the sibling
+    # ../Thermal-Image-Research/uv.lock). Re-check on every version bump.
+    "vismatch>=1.2.0",
+]
 
 [project.scripts]
 cmreg = "cmreg.cli:main"

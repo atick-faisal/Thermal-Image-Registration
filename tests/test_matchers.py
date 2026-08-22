@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import pytest
 
 from cmreg.config import MatchConfig
 from cmreg.matchers import MatcherError, MatchResult, available, empty_result, get_matcher, register
+from cmreg.matchers.vismatch_backend import VISMATCH_MATCHERS
 from tests.conftest import textured_image
 
 MATCHERS = ("sift", "orb")
+HAS_VISMATCH = importlib.util.find_spec("vismatch") is not None
 
 
 @pytest.fixture(scope="module")
@@ -23,14 +27,26 @@ def test_registry_lists_the_builtin_matchers() -> None:
 
 def test_unknown_matcher_names_the_alternatives() -> None:
     with pytest.raises(MatcherError, match="available:"):
-        get_matcher("roma", MatchConfig())
+        get_matcher("no-such-matcher", MatchConfig())
+
+
+@pytest.mark.skipif(not HAS_VISMATCH, reason="the `matchers` extra is not installed")
+def test_the_vismatch_arm_is_registered() -> None:
+    """Registration is gated on `find_spec`, so `available()` never advertises a name that
+    `get_matcher` would then refuse -- a sweep must fail at startup, not six hours in."""
+    assert set(VISMATCH_MATCHERS).issubset(available())
+
+
+@pytest.mark.skipif(HAS_VISMATCH, reason="the `matchers` extra is installed")
+def test_the_vismatch_arm_is_absent_without_the_extra() -> None:
+    assert not set(VISMATCH_MATCHERS) & set(available())
 
 
 def test_registering_a_duplicate_name_is_refused() -> None:
     """Two matchers under one name would produce rows that join together in the results store
     and silently average two different methods."""
     with pytest.raises(MatcherError, match="already registered"):
-        register("sift", lambda config: get_matcher("orb", config))
+        register("sift", lambda config, device: get_matcher("orb", config, device))
 
 
 @pytest.mark.parametrize("name", MATCHERS)
@@ -66,12 +82,22 @@ def test_matching_is_deterministic(name: str, image: np.ndarray) -> None:
 
 @pytest.mark.parametrize("name", MATCHERS)
 def test_confidence_is_plumbed(name: str, image: np.ndarray) -> None:
-    """PLAN.md §15G: every vismatch dense wrapper drops its confidence on the floor. PROSAC
-    needs it, so it is carried from the start."""
+    """PROSAC needs a per-match score and refuses to run without one. PLAN.md §15G recorded
+    vismatch 1.2.0 dropping it; 1.3.1 returns it, and the OpenCV arm has always had it."""
     result = get_matcher(name, MatchConfig())(image, textured_image(np.random.default_rng(11)))
     assert result.confidence is not None
     assert result.confidence.shape == (len(result),)
     assert np.all((result.confidence >= 0.0) & (result.confidence <= 1.0))
+
+
+@pytest.mark.parametrize("name", MATCHERS)
+def test_a_detector_that_finds_nothing_reports_zero_not_null(name: str) -> None:
+    """`0` and `None` are different measurements: `0` is "looked and found nothing", `None` is
+    "this method has no detection stage". Collapsing them makes the column meaningless."""
+    flat = np.full((64, 64), 128, dtype=np.uint8)
+    result = get_matcher(name, MatchConfig())(flat, flat)
+    assert result.n_detected0 == 0
+    assert result.n_detected1 == 0
 
 
 def test_empty_result_uses_two_column_arrays() -> None:

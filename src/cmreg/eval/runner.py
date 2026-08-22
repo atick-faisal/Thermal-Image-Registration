@@ -41,6 +41,7 @@ import numpy as np
 
 from cmreg.config import Config, Modality
 from cmreg.data import DatasetManifest
+from cmreg.device import resolve_device
 from cmreg.estimate import Estimate, estimate_homography
 from cmreg.gt import DenseGT, dense_displacement, generator, overlap_ratio, sample_homography
 from cmreg.imaging import ImagingError, read_gray
@@ -48,6 +49,7 @@ from cmreg.matchers import MatchResult, get_matcher
 from cmreg.metrics import corner_error, diagonal, endpoint_error
 from cmreg.preprocess import GrayImage, preprocess_moving, preprocess_reference
 from cmreg.results import PairRow, Summary, render, render_comparison, summarize, write_rows
+from cmreg.seeding import seed_cell
 from cmreg.tracking import RunTracker, git_sha, run_name, run_tags
 from cmreg.warp import WarpError, apply_warp
 
@@ -99,13 +101,18 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
         raise RunnerError(f"no images in the '{config.data.split}' split of {manifest.path}")
     manifest.pairing.validate_pairs(images)
 
-    matchers = {name: get_matcher(name, config.match) for name in config.match.matchers}
+    # Resolved once, and logged: PLAN.md §15B records RoMa on Windows leaving DINOv2 on the CPU
+    # even with CUDA available, so a run that quietly landed on the wrong device has to be
+    # visible in its own log rather than only in a runtime column six hours later.
+    device = resolve_device(config.runtime.device)
+    matchers = {name: get_matcher(name, config.match, device) for name in config.match.matchers}
     logger.info(
-        "benchmarking %s over %d pairs of %s [%s]",
+        "benchmarking %s over %d pairs of %s [%s] on %s",
         ", ".join(matchers),
         len(images),
         manifest.path.parent.name,
         config.data.split,
+        device,
     )
 
     rows: list[PairRow] = []
@@ -119,7 +126,7 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
             )
             continue
         for name, matcher in matchers.items():
-            rows.append(_evaluate(pair, name, matcher, config, identity))
+            rows.append(_evaluate(pair, index, name, matcher, config, identity))
         if (index + 1) % 50 == 0:
             logger.info("  %d / %d pairs", index + 1, len(images))
 
@@ -206,9 +213,13 @@ def _load_pair(
 
 
 def _evaluate(
-    pair: _Pair, name: str, matcher, config: Config, identity: dict[str, object]
+    pair: _Pair, index: int, name: str, matcher, config: Config, identity: dict[str, object]
 ) -> PairRow:
     """Match, estimate and score one (pair, matcher) cell."""
+    # Before the matcher, not before the run: see `seeding.py::seed_cell`. Dense matchers
+    # sample their correspondences stochastically, and an ambient RNG makes a cell's result
+    # depend on which other matchers happened to share its config.
+    seed_cell(config.gt.seed, index, name)
     moving = preprocess_moving(pair.moving_warped, config.preprocess)
     result: MatchResult = matcher(pair.reference, moving.image)
 
@@ -289,8 +300,8 @@ def _failed_row(stem: str, matcher: str, identity: dict[str, object], reason: st
         corner_err=None,
         epe_mean=None,
         epe_median=None,
-        n_detected_ref=0,
-        n_detected_mov=0,
+        n_detected_ref=None,
+        n_detected_mov=None,
         n_matches=0,
         n_inliers=0,
         inlier_ratio=0.0,

@@ -119,13 +119,19 @@ def _ratio_test(
     )
 
 
-def _sift(config: MatchConfig) -> _OpenCVMatcher:
+# `device` is part of the `MatcherFactory` signature and ignored here: OpenCV's detectors run
+# on the CPU regardless. Accepted rather than special-cased so the registry has one calling
+# convention -- a factory table with two shapes is a `TypeError` waiting for whichever matcher
+# is added next.
+def _sift(config: MatchConfig, device: str) -> _OpenCVMatcher:
+    del device
     return _OpenCVMatcher(
         "sift", cv2.SIFT.create(nfeatures=config.max_keypoints), _SIFT_NORM, config
     )
 
 
-def _orb(config: MatchConfig) -> _OpenCVMatcher:
+def _orb(config: MatchConfig, device: str) -> _OpenCVMatcher:
+    del device
     return _OpenCVMatcher("orb", cv2.ORB.create(nfeatures=config.max_keypoints), _ORB_NORM, config)
 
 

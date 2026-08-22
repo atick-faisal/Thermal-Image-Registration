@@ -114,12 +114,70 @@ def test_metric_keys_match_the_frozen_schema() -> None:
         mace=2.0,
         auc={3.0: 0.9, 5.0: 0.95},
         success_rate={3.0: 0.8},
+        failure_rate=0.25,
+        n_pairs=4,
     ).to_dict()
     assert set(flat) == {
         EPE_MEAN,
         "reg/epe_median",
         MACE,
+        "reg/failure_rate",
+        "reg/n_pairs",
         "reg/auc_3px",
         "reg/auc_5px",
         "reg/success_rate_3px",
     }
+    # `n_pairs` is a count carried in a float-valued dict, because W&B's `log` takes one
+    # mapping and splitting it by type would put the run's size somewhere other than beside
+    # the numbers it qualifies.
+    assert flat["reg/n_pairs"] == 4.0
+
+
+def test_saturation_bounds_a_catastrophic_pair(shape: tuple[int, int] = (480, 640)) -> None:
+    """A projective map's horizon line can pass through the frame, sending nearby pixels
+    arbitrarily far. Measured on MSRS val, one such SIFT fit in 361 pairs drove the dataset
+    `reg/epe_mean` to 5.6e8 px while the median stayed at 570 px."""
+    from cmreg.metrics import diagonal, endpoint_error
+
+    bound = diagonal(shape)
+    assert bound == pytest.approx(800.0, abs=1.0)
+
+    truth = np.zeros((2, 4, 4), dtype=np.float64)
+    predicted = np.zeros_like(truth)
+    predicted[0, 0, 0] = 1e9
+    predicted[0, 1, 1] = np.inf
+
+    unbounded = endpoint_error(predicted, truth)
+    assert unbounded.mean > 1e7
+    assert unbounded.n_saturated == 0
+
+    saturated = endpoint_error(predicted, truth, saturate_at=bound)
+    assert saturated.n_saturated == 2
+    assert saturated.mean == pytest.approx(2 * bound / 16)
+
+
+def test_saturation_cannot_change_a_sub_threshold_comparison() -> None:
+    """Every threshold in PLAN.md §6.1 is 10 px or less, so the bound only ever compresses
+    errors that were already failures."""
+    from cmreg.metrics import diagonal, endpoint_error
+
+    truth = np.zeros((2, 4, 4), dtype=np.float64)
+    predicted = np.full_like(truth, 2.0)
+    plain = endpoint_error(predicted, truth)
+    clipped = endpoint_error(predicted, truth, saturate_at=diagonal((480, 640)))
+    assert clipped.mean == pytest.approx(plain.mean)
+    assert clipped.n_saturated == 0
+
+
+def test_saturated_corner_error_is_bounded_by_the_diagonal() -> None:
+    from cmreg.metrics import corner_error, diagonal
+
+    shape = (480, 640)
+    truth = np.eye(3)
+    # A homography whose horizon line (w = 1 - 0.0015624x = 0, i.e. x = 640.04) sits a
+    # fraction of a pixel outside the right edge: the two corners there map near-infinitely
+    # far. Note `check_homography` accepts it -- its determinant is exactly 1 -- which is the
+    # point: this is a legitimate projective map, not a numerically singular one.
+    degenerate = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.0015624, 0.0, 1.0]])
+    assert corner_error(degenerate, truth, shape) > 1e4
+    assert corner_error(degenerate, truth, shape, saturate=True) <= diagonal(shape)

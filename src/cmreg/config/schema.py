@@ -45,6 +45,51 @@ class Platform(StrEnum):
     PUBLIC = "public"
 
 
+class Modality(StrEnum):
+    """Which of the two images something refers to.
+
+    Named ``optical``/``thermal`` rather than ``moving``/``fixed`` because the choice of which
+    one moves is per-experiment (``GTConfig.moving``): the production path warps optical into
+    thermal geometry, the public benchmarks are indexed the other way (``data/pairing.py``)."""
+
+    OPTICAL = "optical"
+    THERMAL = "thermal"
+
+
+class Variant(StrEnum):
+    """A named preprocessing recipe (TASKS.md P3-2).
+
+    Recipes rather than a composable op list: the benchmark reports one string per axis, and a
+    free-form pipeline spelling would make two runs that did the same thing unjoinable in the
+    results store. Adding a recipe is one registry entry (``preprocess/variants.py``)."""
+
+    NONE = "none"
+    INVERT = "invert"
+    CLAHE = "clahe"
+    CLAHE_INVERT = "clahe_invert"
+    PERCENTILE = "percentile"
+    PERCENTILE_INVERT = "percentile_invert"
+    GRADIENT = "gradient"
+
+
+class Interpolation(StrEnum):
+    """Resampling kernel for thermal upsampling (TASKS.md P3-9)."""
+
+    NEAREST = "nearest"
+    BILINEAR = "bilinear"
+    BICUBIC = "bicubic"
+    LANCZOS = "lanczos"
+
+
+class Estimator(StrEnum):
+    """Robust homography estimators (TASKS.md P3-3, PLAN.md §4.1)."""
+
+    MAGSAC = "magsac"
+    RANSAC = "ransac"
+    LMEDS = "lmeds"
+    PROSAC = "prosac"
+
+
 class RuntimeConfig(ConfigBase):
     """Where and how a run executes. **Excluded wholesale from `config_hash()`** -- the same
     experiment on two machines under two names must carry one hash, or the hash means
@@ -53,8 +98,12 @@ class RuntimeConfig(ConfigBase):
     # "auto" resolves at startup. A hardcoded "cuda" fails the Mac dev box; a hardcoded
     # "cpu" silently wastes the A100s.
     device: str = "auto"
-    # The run's identity in W&B and on disk. Two runs sharing a name overwrite each other's
-    # outputs and become indistinguishable in the results store.
+    # Names the run *directory* and the `run_name` column. Two runs sharing a name overwrite
+    # each other's outputs and become indistinguishable in the results store. The W&B run name
+    # is not this -- it is derived per matcher into TASKS.md §0's frozen
+    # `{phase}_{method}_{dataset}_{variant}_s{seed}` format (`eval/runner.py::_publish`), so a
+    # campaign that overrides the matcher on the command line cannot file every cell under one
+    # W&B name.
     name: str = "unnamed"
     # Run output root. Under `runs/`, which is git-ignored: results must not travel back to
     # the server through git.
@@ -107,6 +156,11 @@ class GTConfig(ConfigBase):
     # Scientific, not invocational -- so it belongs here and not in `runtime`. A silently
     # changed seed is drift that no amount of averaging will reveal.
     seed: int = 0
+    # Which modality receives the synthetic warp; the other is the reference frame every
+    # metric is expressed in. Flipping it silently changes what the benchmark measures --
+    # thermal is typically the lower-resolution, harder side, so warping optical instead
+    # makes every number look better for no methodological reason.
+    moving: Modality = Modality.THERMAL
     # Rotation half-range in degrees (PLAN.md §5 Tier 1: +/-30 deg). Widening it past what
     # any matcher tolerates turns the whole benchmark into a floor of failures.
     rotation_deg: float = 30.0
@@ -158,12 +212,156 @@ class EvalConfig(ConfigBase):
         return value
 
 
+class PreprocessConfig(ConfigBase):
+    """The preprocessing front-end (TASKS.md P3-2, PLAN.md §4.1).
+
+    ``reference``/``moving`` default to the recipe the three sibling implementations converged
+    on (PLAN.md §15B): invert the optical grayscale, percentile-normalise the thermal.
+    """
+
+    # Recipe for the reference (unwarped) side. `invert` is the hand-crafted polarity fix the
+    # learned front-end of P5-5 has to beat; turning it off is the P3-8 generality ablation.
+    reference: Variant = Variant.INVERT
+    # Recipe for the moving (warped) side.
+    moving: Variant = Variant.PERCENTILE
+    # Percentile clip bounds. PLAN.md §15D records this discrepancy rather than inheriting it:
+    # production uses 0.3/99.75, the batch pipeline and display code use 2/98. Making it a
+    # field means a run states which it used instead of two codebases disagreeing silently.
+    percentile_low: float = 2.0
+    percentile_high: float = 98.0
+    # CLAHE contrast ceiling. Too high amplifies sensor noise into false corners; too low is
+    # indistinguishable from no CLAHE at all and the ablation row goes flat for the wrong reason.
+    clahe_clip: float = 2.0
+    # CLAHE tile grid (square). Tiles larger than the structures of interest wash out exactly
+    # the local contrast the operator exists to recover.
+    clahe_tile: int = 8
+    # Thermal upsampling factor (PLAN.md §4.1: x1-4). Keypoints are mapped back to native
+    # pixels before estimation, so this never changes the units a metric is reported in --
+    # if that plumbing were dropped, every upsampled run would report errors inflated by the
+    # factor and look catastrophically worse.
+    moving_upsample: int = 1
+    # Kernel used for that upsampling. `nearest` is included only as the ablation's floor;
+    # it introduces staircase edges that gradient-based detectors happily fire on.
+    moving_interpolation: Interpolation = Interpolation.BICUBIC
+
+    @model_validator(mode="after")
+    def _percentiles_ordered(self) -> Self:
+        if not 0.0 <= self.percentile_low < self.percentile_high <= 100.0:
+            raise ValueError(
+                "require 0 <= percentile_low < percentile_high <= 100, got "
+                f"{self.percentile_low} / {self.percentile_high}"
+            )
+        return self
+
+    @field_validator("moving_upsample")
+    @classmethod
+    def _upsample_range(cls, value: int) -> int:
+        if not 1 <= value <= 8:
+            raise ValueError(f"moving_upsample must be in [1, 8], got {value}")
+        return value
+
+    @field_validator("clahe_tile")
+    @classmethod
+    def _positive_tile(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"clahe_tile must be >= 1, got {value}")
+        return value
+
+    @field_validator("clahe_clip")
+    @classmethod
+    def _positive_clip(cls, value: float) -> float:
+        if value <= 0.0:
+            raise ValueError(f"clahe_clip must be > 0, got {value}")
+        return value
+
+
+class MatchConfig(ConfigBase):
+    """Which matchers run, and their shared budget."""
+
+    # Registry names (`cmreg.matchers.available()`). Validated there rather than here so the
+    # config layer stays importable without cv2/torch; an unknown name fails at startup with
+    # the available list, not mid-sweep.
+    matchers: tuple[str, ...] = ("sift",)
+    # Detector budget. Uncapped, a textured 640x512 pair yields tens of thousands of SIFT
+    # keypoints and the quadratic brute-force match dominates the runtime table (PLAN.md §6.5).
+    max_keypoints: int = 4096
+    # Lowe ratio. Raising it trades precision for recall -- more matches, lower inlier ratio,
+    # and a robust estimator that has to work harder; 0.8 is Lowe's own value.
+    ratio_test: float = 0.8
+
+    @field_validator("matchers")
+    @classmethod
+    def _non_empty_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("matchers must name at least one matcher")
+        if len(set(value)) != len(value):
+            raise ValueError(f"matchers contains duplicates: {value}")
+        return value
+
+    @field_validator("ratio_test")
+    @classmethod
+    def _ratio_range(cls, value: float) -> float:
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"ratio_test must be in (0, 1], got {value}")
+        return value
+
+    @field_validator("max_keypoints")
+    @classmethod
+    def _positive(cls, value: int) -> int:
+        if value < 4:
+            raise ValueError(f"max_keypoints must be >= 4 (a homography needs 4), got {value}")
+        return value
+
+
+class EstimateConfig(ConfigBase):
+    """Robust estimation (TASKS.md P3-3). Swept by P3-10."""
+
+    # Which estimator. LMEDS ignores `threshold_px` entirely (it minimises the median residual)
+    # and assumes under 50% outliers -- a threshold sweep row for LMEDS is therefore flat by
+    # construction, which is a property of the method and not a bug in the sweep.
+    method: Estimator = Estimator.MAGSAC
+    # Inlier threshold in pixels. PLAN.md §6.4: shrinking this lowers `match/reproj_err`
+    # artificially, which is why that metric is reported but never led with.
+    threshold_px: float = 3.0
+    # Iteration cap. Too low and the estimator silently returns whatever it found first, which
+    # reads as a hard matcher failure rather than an exhausted search.
+    max_iters: int = 10_000
+    # Target confidence. Passed by keyword: `cv2.findHomography`'s fifth positional slot is
+    # `mask`, and PLAN.md §15A records the upstream harness losing this value to exactly that
+    # off-by-one -- its confidence silently stayed at OpenCV's 0.995 default.
+    confidence: float = 0.9999
+
+    @field_validator("threshold_px")
+    @classmethod
+    def _positive_threshold(cls, value: float) -> float:
+        if value <= 0.0:
+            raise ValueError(f"threshold_px must be > 0, got {value}")
+        return value
+
+    @field_validator("max_iters")
+    @classmethod
+    def _positive_iters(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"max_iters must be >= 1, got {value}")
+        return value
+
+    @field_validator("confidence")
+    @classmethod
+    def _confidence_range(cls, value: float) -> float:
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"confidence must be in (0, 1), got {value}")
+        return value
+
+
 class Config(ConfigBase):
     """The fully-resolved experiment."""
 
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     gt: GTConfig = Field(default_factory=GTConfig)
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
+    match: MatchConfig = Field(default_factory=MatchConfig)
+    estimate: EstimateConfig = Field(default_factory=EstimateConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
 
     @classmethod

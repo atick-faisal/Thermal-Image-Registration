@@ -7,6 +7,7 @@ from cmreg.metrics.registration import (
     MetricError,
     auc,
     corner_error,
+    diagonal,
     endpoint_error,
     success_rate,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "auc",
     "auc_key",
     "corner_error",
+    "diagonal",
     "endpoint_error",
     "success_rate",
     "success_rate_key",

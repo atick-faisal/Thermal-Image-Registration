@@ -1,2 +1,8 @@
-"""The evaluation runner (TASKS.md P3-5): one config -> one W&B run -> per-pair rows to
-Parquet plus summary metrics to W&B."""
+"""The evaluation runner (TASKS.md P3-5): one config -> one W&B run per matcher -> per-pair
+rows to Parquet plus the copy-pasteable console block."""
+
+from __future__ import annotations
+
+from cmreg.eval.runner import COMPARISON_KEYS, WARP_MODEL, RunnerError, run_benchmark
+
+__all__ = ["COMPARISON_KEYS", "WARP_MODEL", "RunnerError", "run_benchmark"]

@@ -26,8 +26,43 @@ against different PyTorch indices. Syncing without an extra leaves torch unresol
 
 ```sh
 uv run cmreg --version
-uv run cmreg gt --config experiments/smoke.yaml    # Tier-1 dense synthetic-warp GT
+uv run cmreg matchers                              # registered matcher names
+uv run cmreg gt     -c experiments/smoke.yaml      # Tier-1 dense synthetic-warp GT
+uv run cmreg bench  -c experiments/p3_msrs_classical.yaml   # one benchmark cell
+uv run cmreg report runs/p3_msrs_classical         # re-render the result block
 ```
+
+### Getting results off the training server
+
+The Windows training box cannot hand files back, so results travel two ways and neither
+needs a file transfer:
+
+* **W&B** carries summary metrics, the resolved config, and the tag set. One run per
+  matcher, named to `TASKS.md` §0's `{phase}_{method}_{dataset}_{variant}_s{seed}` format.
+* **The console block** printed at the end of every `bench` carries the full frozen metric
+  schema, the config hash and the git SHA in one copy-pasteable selection. `cmreg report`
+  re-renders it from an existing run directory without re-running anything.
+
+The per-pair Parquet store stays on the machine that produced it. It is the substrate the
+Phase-8 aggregator reads, not a thing anyone has to move.
+
+### Pointing at a dataset
+
+`dataset/` is git-ignored wholesale, so each machine writes its own manifest. For the MSRS
+copy already adapted by the sibling `Thermal-To-Optical-Translation` project:
+
+```yaml
+# dataset/processed/msrs/data.yaml
+path: /abs/path/to/Thermal-To-Optical-Translation/dataset/processed/msrs
+train: train/visible/images
+val: val/visible/images
+rgbt:
+  optical_token: visible
+  thermal_token: infrared
+```
+
+The `rgbt` tokens name the *path segment* that distinguishes the two modalities; pairing
+substitutes one for the other rather than zipping two sorted directory listings.
 
 ## Workflow
 

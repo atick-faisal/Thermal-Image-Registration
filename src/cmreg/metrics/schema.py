@@ -19,6 +19,16 @@ EPE_MEAN = "reg/epe_mean"
 EPE_MEDIAN = "reg/epe_median"
 MACE = "reg/mace"
 
+# Failure accounting. An *addition* to the minimum set TASKS.md §0 lists, not a rename of any
+# of it, so X-5 ("schema unchanged, or migration applied to all prior runs") is satisfied
+# without migration. It is here because the alternative is worse: a failed pair has no
+# homography and so cannot contribute an EPE or a corner error, meaning `reg/epe_*` and
+# `reg/mace` are necessarily means over *successes only*. Reporting those without the failure
+# rate beside them lets a method that solves 5% of pairs beautifully outrank one that solves
+# all of them well, which is how a benchmark table stops being defensible.
+FAILURE_RATE = "reg/failure_rate"
+N_PAIRS = "reg/n_pairs"
+
 # Matching and robust estimation. `match/reproj_err` is reported but never led with: PLAN.md
 # §6.4 records that it is gameable -- a degenerate 4-point homography scores near zero, and
 # shrinking the RANSAC threshold lowers it artificially.
@@ -74,6 +84,12 @@ class RegistrationMetrics:
     mace: float
     auc: dict[float, float]
     success_rate: dict[float, float]
+    # Fraction of pairs with no fitted homography. Unlike the three means above, `auc` and
+    # `success_rate` *do* include failures -- they enter as infinite corner error, which
+    # contributes zero to both -- so the two families are not means over the same set. That
+    # asymmetry is deliberate and is why this field is not optional.
+    failure_rate: float
+    n_pairs: int
 
     def to_dict(self) -> dict[str, float]:
         """Flatten to the logged key names. This is the only place metric keys are emitted."""
@@ -81,6 +97,8 @@ class RegistrationMetrics:
             EPE_MEAN: self.epe_mean,
             EPE_MEDIAN: self.epe_median,
             MACE: self.mace,
+            FAILURE_RATE: self.failure_rate,
+            N_PAIRS: float(self.n_pairs),
         }
         flat.update({auc_key(t): v for t, v in self.auc.items()})
         flat.update({success_rate_key(t): v for t, v in self.success_rate.items()})

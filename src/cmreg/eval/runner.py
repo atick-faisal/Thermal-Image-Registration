@@ -1,0 +1,346 @@
+"""The evaluation cell (TASKS.md P3-5): one config, one Parquet file, one console block.
+
+AGENTS.md's non-negotiable is that there is **one evaluation path** -- every method computes
+every metric through this code, because that is what makes the comparison table defensible.
+This module is that path.
+
+Protocol
+--------
+The public benchmarks are *pre-registered*: optical and thermal are already pixel-aligned, so
+the true cross-modal homography between them is the identity. Tier-1 ground truth is
+manufactured by breaking that alignment with a known warp (PLAN.md §5):
+
+1. Sample ``H_gt`` for pair *i* from ``(seed, i)`` -- the same derivation ``cmreg gt`` uses,
+   so a bench run and its GT file agree by construction rather than by coincidence.
+2. Warp the moving modality by ``H_gt``. The other modality is the reference frame, and every
+   metric below is in *its* pixels.
+3. The matcher's job is to undo that: recover the map from the warped moving image back to the
+   reference. The truth for that direction is therefore ``inv(H_gt)``, and getting this inverse
+   backwards is the single most likely error in the whole pipeline -- which is why
+   ``tests/test_runner.py`` pins it end to end with a same-modality pair rather than only
+   unit-testing the pieces.
+
+Loop order is pairs-outer, matchers-inner: decoding, warping and preprocessing depend only on
+the config, so doing them once per pair rather than once per (pair, matcher) is the difference
+between a benchmark that runs overnight and one that does not.
+
+Failures are rows. A pair the matcher cannot solve is recorded with ``success=False`` and a
+reason, never dropped (TASKS.md X-4) -- a benchmark that silently discards its hard cases
+reports the score of an easier dataset than the one it claims.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+from cmreg.config import Config, Modality
+from cmreg.data import DatasetManifest
+from cmreg.estimate import Estimate, estimate_homography
+from cmreg.gt import DenseGT, dense_displacement, generator, overlap_ratio, sample_homography
+from cmreg.imaging import ImagingError, read_gray
+from cmreg.matchers import MatchResult, get_matcher
+from cmreg.metrics import corner_error, diagonal, endpoint_error
+from cmreg.preprocess import GrayImage, preprocess_moving, preprocess_reference
+from cmreg.results import PairRow, Summary, render, render_comparison, summarize, write_rows
+from cmreg.tracking import RunTracker, git_sha, run_name, run_tags
+from cmreg.warp import WarpError, apply_warp
+
+logger = logging.getLogger(__name__)
+
+# The only warp model implemented; a column rather than a constant so P3-4's affine, similarity,
+# TPS and residual-flow entries slot in without a schema migration.
+WARP_MODEL = "homography"
+
+# Metrics shown in the multi-matcher comparison table. The headline three plus the tightest
+# threshold: enough to rank methods at a glance, short enough to stay one line per matcher.
+COMPARISON_KEYS = (
+    "reg/mace",
+    "reg/epe_mean",
+    "reg/auc_3px",
+    "reg/success_rate_3px",
+    "reg/failure_rate",
+    "match/inliers",
+    "time/total_ms",
+)
+
+
+class RunnerError(RuntimeError):
+    """Raised for a run that cannot start -- an empty split, an unknown matcher."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Pair:
+    """One decoded pair, warped and preprocessed once for all matchers."""
+
+    stem: str
+    shape: tuple[int, int]
+    reference: GrayImage
+    moving_warped: GrayImage
+    # `H_gt` maps the moving image into the reference canvas; the matcher has to recover its
+    # inverse. Both are carried so nothing downstream has to remember which is which.
+    truth: np.ndarray
+    gt_field: DenseGT
+    overlap: float
+
+
+def run_benchmark(config: Config) -> tuple[Summary, ...]:
+    """Run every configured matcher over a split and return one summary each."""
+    manifest = DatasetManifest.load(config.data.manifest)
+    images = manifest.images(config.data.split)
+    if config.data.limit:
+        images = images[: config.data.limit]
+    if not images:
+        raise RunnerError(f"no images in the '{config.data.split}' split of {manifest.path}")
+    manifest.pairing.validate_pairs(images)
+
+    matchers = {name: get_matcher(name, config.match) for name in config.match.matchers}
+    logger.info(
+        "benchmarking %s over %d pairs of %s [%s]",
+        ", ".join(matchers),
+        len(images),
+        manifest.path.parent.name,
+        config.data.split,
+    )
+
+    rows: list[PairRow] = []
+    identity = _identity_columns(config, manifest)
+    for index, optical_path in enumerate(images):
+        pair = _load_pair(optical_path, manifest, config, index)
+        if pair is None:
+            rows.extend(
+                _failed_row(optical_path.stem, name, identity, "unreadable_pair")
+                for name in matchers
+            )
+            continue
+        for name, matcher in matchers.items():
+            rows.append(_evaluate(pair, name, matcher, config, identity))
+        if (index + 1) % 50 == 0:
+            logger.info("  %d / %d pairs", index + 1, len(images))
+
+    run_dir = Path(config.runtime.path)
+    config.snapshot(run_dir)
+    write_rows(rows, run_dir)
+
+    summaries = tuple(
+        summarize([row for row in rows if row.matcher == name], config.eval.thresholds_px)
+        for name in matchers
+    )
+    _publish(config, summaries)
+    return summaries
+
+
+def _identity_columns(config: Config, manifest: DatasetManifest) -> dict[str, object]:
+    """The columns constant across every row of this run."""
+    return {
+        "dataset": manifest.path.parent.name,
+        "split": config.data.split,
+        "domain": config.eval.domain.value,
+        "platform": config.eval.platform.value,
+        "preprocess_ref": config.preprocess.reference.value,
+        "preprocess_mov": config.preprocess.moving.value,
+        "upsample": config.preprocess.moving_upsample,
+        "interpolation": config.preprocess.moving_interpolation.value,
+        "estimator": config.estimate.method.value,
+        "threshold_px": config.estimate.threshold_px,
+        "warp": WARP_MODEL,
+        "moving": config.gt.moving.value,
+        "seed": config.gt.seed,
+        "config_hash": config.config_hash(),
+        "git_sha": git_sha(),
+        "run_name": config.runtime.name,
+    }
+
+
+def _load_pair(
+    optical_path: Path, manifest: DatasetManifest, config: Config, index: int
+) -> _Pair | None:
+    """Decode, warp and preprocess one pair. ``None`` when the pair cannot be used at all."""
+    thermal_path = manifest.pairing.thermal_path(optical_path)
+    try:
+        optical = read_gray(optical_path)
+        thermal = read_gray(thermal_path)
+    except ImagingError:
+        logger.warning("could not read pair %s; recording it as a failure", optical_path.stem)
+        return None
+
+    if optical.shape != thermal.shape:
+        # A "pre-registered" dataset whose modalities differ in size is not pre-registered.
+        # TASKS.md P1-3 says to spot-check rather than trust the README; this is that check,
+        # enforced per pair so one bad file does not invalidate a six-hour run.
+        logger.warning(
+            "%s: optical %s and thermal %s differ in shape; pair is not pre-registered",
+            optical_path.stem,
+            optical.shape,
+            thermal.shape,
+        )
+        return None
+
+    reference, moving = (
+        (optical, thermal) if config.gt.moving is Modality.THERMAL else (thermal, optical)
+    )
+    shape = reference.shape
+
+    homography = sample_homography(config.gt, generator(config.gt.seed, index), shape)
+    try:
+        moving_warped = np.asarray(apply_warp(moving, homography, out_shape=shape), np.uint8)
+        truth = np.linalg.inv(homography)
+    except (WarpError, np.linalg.LinAlgError):  # pragma: no cover - sample_homography validates
+        logger.warning("%s: sampled homography is not usable", optical_path.stem)
+        return None
+
+    return _Pair(
+        stem=optical_path.stem,
+        shape=shape,
+        reference=preprocess_reference(reference, config.preprocess).image,
+        moving_warped=moving_warped,
+        truth=truth,
+        gt_field=dense_displacement(truth, shape),
+        overlap=overlap_ratio(dense_displacement(homography, shape)),
+    )
+
+
+def _evaluate(
+    pair: _Pair, name: str, matcher, config: Config, identity: dict[str, object]
+) -> PairRow:
+    """Match, estimate and score one (pair, matcher) cell."""
+    moving = preprocess_moving(pair.moving_warped, config.preprocess)
+    result: MatchResult = matcher(pair.reference, moving.image)
+
+    # Back to native pixels before estimation, so every metric is in reference-image units
+    # whatever the upsampling factor was (preprocess/variants.py explains the half-pixel term).
+    kpts_reference = result.kpts0
+    kpts_moving = moving.to_native(result.kpts1)
+
+    start = time.perf_counter()
+    # src is the warped moving image, dst is the reference: the estimate must map the moving
+    # image back into the reference frame, which is the direction `truth` describes.
+    estimate = estimate_homography(kpts_moving, kpts_reference, config.estimate, result.confidence)
+    estimate_ms = (time.perf_counter() - start) * 1e3
+
+    return _row(pair, name, identity, result, estimate, estimate_ms)
+
+
+def _row(
+    pair: _Pair,
+    matcher: str,
+    identity: dict[str, object],
+    result: MatchResult,
+    estimate: Estimate,
+    estimate_ms: float,
+) -> PairRow:
+    corner_err: float | None = None
+    epe_mean: float | None = None
+    epe_median: float | None = None
+    failure_reason = estimate.failure_reason
+
+    if estimate.h is not None:
+        corner_err = corner_error(estimate.h, pair.truth, pair.shape, saturate=True)
+        predicted = dense_displacement(estimate.h, pair.shape)
+        # Scored on the GT's valid mask, not the prediction's: the pixels with ground truth
+        # are a property of the pair, and letting a method choose its own scored region would
+        # reward one that maps most of the image off-canvas.
+        error = endpoint_error(
+            predicted.flow,
+            pair.gt_field.flow,
+            pair.gt_field.valid,
+            saturate_at=diagonal(pair.shape),
+        )
+        epe_mean, epe_median = error.mean, error.median
+
+    return PairRow(
+        stem=pair.stem,
+        matcher=matcher,
+        success=estimate.h is not None,
+        failure_reason=failure_reason,
+        overlap=pair.overlap,
+        corner_err=corner_err,
+        epe_mean=epe_mean,
+        epe_median=epe_median,
+        n_detected_ref=result.n_detected0,
+        n_detected_mov=result.n_detected1,
+        n_matches=len(result),
+        n_inliers=estimate.n_inliers,
+        inlier_ratio=estimate.inlier_ratio,
+        reproj_err=None if estimate.h is None else estimate.reproj_err,
+        extract_ms=result.extract_ms,
+        match_ms=result.match_ms,
+        estimate_ms=estimate_ms,
+        # The method's cost, excluding decode and warp: those are dataset properties shared by
+        # every matcher, and folding them in would flatten the runtime table (PLAN.md §6.5).
+        total_ms=result.extract_ms + result.match_ms + estimate_ms,
+        **identity,  # type: ignore[arg-type]
+    )
+
+
+def _failed_row(stem: str, matcher: str, identity: dict[str, object], reason: str) -> PairRow:
+    """A row for a pair that never reached the matcher."""
+    return PairRow(
+        stem=stem,
+        matcher=matcher,
+        success=False,
+        failure_reason=reason,
+        overlap=float("nan"),
+        corner_err=None,
+        epe_mean=None,
+        epe_median=None,
+        n_detected_ref=0,
+        n_detected_mov=0,
+        n_matches=0,
+        n_inliers=0,
+        inlier_ratio=0.0,
+        reproj_err=None,
+        extract_ms=0.0,
+        match_ms=0.0,
+        estimate_ms=0.0,
+        total_ms=0.0,
+        **identity,  # type: ignore[arg-type]
+    )
+
+
+def _publish(config: Config, summaries: Sequence[Summary]) -> None:
+    """Send each summary to W&B and print its console block.
+
+    One W&B run per matcher, named to TASKS.md §0's frozen format. ``runtime.name`` names the
+    local run directory; the W&B name is *derived*, because a campaign that overrides the
+    matcher on the command line would otherwise file every cell under one name.
+    """
+    for summary in summaries:
+        matcher = summary.context["matcher"]
+        variant = (
+            f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
+            f"-x{config.preprocess.moving_upsample}-{config.estimate.method.value}"
+        )
+        cell = config.model_copy(
+            update={
+                "runtime": config.runtime.model_copy(
+                    update={
+                        "name": run_name(
+                            "p3",
+                            matcher,
+                            config.data.manifest.parent.name,
+                            variant,
+                            config.gt.seed,
+                        )
+                    }
+                )
+            }
+        )
+        tags = run_tags(
+            cell,
+            matcher=matcher,
+            preprocess=variant,
+            estimator=config.estimate.method.value,
+            warp=WARP_MODEL,
+        )
+        with RunTracker(cell, tags) as tracker:
+            tracker.log(summary.metrics)
+        print(render(summary))
+
+    if len(summaries) > 1:
+        print(render_comparison(summaries, COMPARISON_KEYS))

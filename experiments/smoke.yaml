@@ -16,11 +16,33 @@ data:
 
 gt:
   seed: 0
+  moving: thermal
   rotation_deg: 30.0
   scale_min: 0.8
   scale_max: 1.25
   perspective: 0.05
   translation: 0.05
+
+preprocess:
+  reference: invert
+  moving: percentile
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1
+  moving_interpolation: bicubic
+
+match:
+  matchers: [sift, orb]
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
 
 eval:
   thresholds_px: [3.0, 5.0, 10.0]

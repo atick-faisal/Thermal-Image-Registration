@@ -1,0 +1,55 @@
+# P3-7 / P3-8: the classical arm on MSRS. The first real cell of CM-Reg-Bench, and the CPU
+# floor every learned matcher is measured against.
+#
+# MSRS is a driving-domain, pre-registered public set, so its Tier-1 ground truth is a known
+# synthetic warp (PLAN.md §5) rather than an annotation. SIFT is expected to do *badly* here:
+# it matches intensity gradients, and the optical-thermal intensity relation is not monotonic.
+# A weak number is the correct floor. A strong one means the cell is accidentally matching two
+# renderings of the same modality, and the run is wrong rather than good.
+runtime:
+  device: cpu
+  name: p3_msrs_classical
+  path: runs/p3_msrs_classical
+  wandb: false
+  wandb_project: cmreg-bench
+  group: p3_msrs_classical_s0
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  limit: 0
+
+gt:
+  seed: 0
+  moving: thermal
+  rotation_deg: 30.0
+  scale_min: 0.8
+  scale_max: 1.25
+  perspective: 0.05
+  translation: 0.05
+
+preprocess:
+  reference: invert          # the PLAN.md §15B recipe: invert the optical grayscale
+  moving: percentile         # ... and percentile-normalise the thermal
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1         # MSRS ships both modalities at one resolution
+  moving_interpolation: bicubic
+
+match:
+  matchers: [sift, orb]
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
+
+eval:
+  thresholds_px: [3.0, 5.0, 10.0]
+  domain: driving
+  platform: public

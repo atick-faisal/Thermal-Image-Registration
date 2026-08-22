@@ -20,8 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from cmreg import __version__
+from cmreg.config.schema import Estimator, Variant
 
 logger = logging.getLogger("cmreg")
+
+_VARIANTS = [v.value for v in Variant]
 
 # flag name -> dotted path into the config. See convention 2 above.
 _OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -33,6 +36,12 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "split": ("data", "split"),
     "limit": ("data", "limit"),
     "seed": ("gt", "seed"),
+    "matchers": ("match", "matchers"),
+    "estimator": ("estimate", "method"),
+    "threshold": ("estimate", "threshold_px"),
+    "preprocess_ref": ("preprocess", "reference"),
+    "preprocess_mov": ("preprocess", "moving"),
+    "upsample": ("preprocess", "moving_upsample"),
 }
 
 
@@ -64,6 +73,25 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--split", choices=("train", "val"))
     parser.add_argument("--limit", type=int, help="cap the number of pairs (0 = all)")
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--matchers",
+        type=_comma_separated,
+        help="comma-separated matcher names, e.g. 'sift,orb' (see `cmreg matchers`)",
+    )
+    parser.add_argument("--estimator", choices=[e.value for e in Estimator])
+    parser.add_argument("--threshold", type=float, help="estimator inlier threshold in pixels")
+    parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
+    parser.add_argument("--preprocess-mov", dest="preprocess_mov", choices=_VARIANTS)
+    parser.add_argument("--upsample", type=int, help="thermal upsampling factor (1-8)")
+
+
+def _comma_separated(value: str) -> tuple[str, ...]:
+    """``--matchers sift,orb`` -> ``("sift", "orb")``.
+
+    A comma list rather than ``action="append"``: sweeps are launched from shell loops, and a
+    single token is far easier to build there than a repeated flag.
+    """
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +107,26 @@ def build_parser() -> argparse.ArgumentParser:
     gt = subparsers.add_parser("gt", help="generate Tier-1 synthetic-warp ground truth for a split")
     _add_config_args(gt)
     gt.set_defaults(handler=_run_gt)
+
+    bench = subparsers.add_parser("bench", help="run one benchmark cell over a split")
+    _add_config_args(bench)
+    bench.set_defaults(handler=_run_bench)
+
+    report = subparsers.add_parser(
+        "report", help="re-render the console block from an existing run directory"
+    )
+    report.add_argument("run_dir", type=Path, help="a run directory, or a .parquet file")
+    report.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=(3.0, 5.0, 10.0),
+        help="corner-error thresholds in pixels for AUC and success rate",
+    )
+    report.set_defaults(handler=_run_report)
+
+    matchers = subparsers.add_parser("matchers", help="list the registered matchers")
+    matchers.set_defaults(handler=_run_matchers)
 
     return parser
 
@@ -137,6 +185,44 @@ def _run_gt(args: argparse.Namespace) -> int:
     logger.info(
         "wrote %d Tier-1 GT records to %s (mean overlap %.3f)", len(records), target, mean_overlap
     )
+    return 0
+
+
+def _run_bench(args: argparse.Namespace) -> int:
+    from cmreg.config import Config
+    from cmreg.eval import run_benchmark
+
+    config = Config.load(args.config, overrides_from_args(args))
+    run_benchmark(config)
+    return 0
+
+
+def _run_report(args: argparse.Namespace) -> int:
+    from cmreg.eval import COMPARISON_KEYS
+    from cmreg.results import read_rows, render, render_comparison, summarize
+
+    rows = read_rows(args.run_dir)
+    # Preserve first-appearance order rather than sorting: it is the order the run produced
+    # them in, which is the order the original block was printed in, so a re-render is
+    # diffable against a pasted one.
+    names = list(dict.fromkeys(row.matcher for row in rows))
+    summaries = [
+        summarize([row for row in rows if row.matcher == name], tuple(args.thresholds))
+        for name in names
+    ]
+    for summary in summaries:
+        print(render(summary))
+    if len(summaries) > 1:
+        print(render_comparison(summaries, COMPARISON_KEYS))
+    return 0
+
+
+def _run_matchers(args: argparse.Namespace) -> int:
+    del args
+    from cmreg.matchers import available
+
+    for name in available():
+        print(name)
     return 0
 
 

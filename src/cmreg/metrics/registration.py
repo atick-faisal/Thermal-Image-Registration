@@ -26,6 +26,28 @@ class MetricError(ValueError):
     """Raised when a metric is asked for on inputs that cannot support it."""
 
 
+def diagonal(shape: tuple[int, int]) -> float:
+    """The image diagonal: the saturation bound for every displacement error here.
+
+    A homography is a projective map, so its horizon line -- the locus where the third
+    homogeneous coordinate vanishes -- can pass *through* the frame. Pixels near it are sent
+    arbitrarily far away, and a single such pair contributes an essentially unbounded term to
+    a dataset mean. Measured on MSRS val, one near-degenerate SIFT fit in 361 pairs drove
+    ``reg/epe_mean`` to 5.6e8 px while the median sat at 570 px: the mean reported that one
+    pair and nothing else.
+
+    Saturating at the diagonal fixes this without inventing a constant. The diagonal is the
+    largest displacement that still means anything for an image of this size -- beyond it a
+    pixel is simply *off the image*, and "off the image by one width" and "off the image by a
+    million widths" are the same registration outcome. It cannot change any comparison that
+    was not already between two failures: every threshold in PLAN.md §6.1 is 10 px or less.
+
+    Stated in the paper's protocol section, not left implicit.
+    """
+    height, width = shape
+    return float(np.hypot(height, width))
+
+
 @dataclass(frozen=True, slots=True)
 class EndPointError:
     """Per-pixel displacement error, summarised.
@@ -38,17 +60,26 @@ class EndPointError:
     mean: float
     median: float
     count: int
+    # Pixels whose error was clipped to the saturation bound. Nonzero means this pair's
+    # homography sends part of the frame past its horizon line, i.e. a catastrophic failure
+    # rather than a merely inaccurate fit.
+    n_saturated: int = 0
 
 
 def endpoint_error(
     predicted: NDArray[np.floating],
     truth: NDArray[np.floating],
     valid: NDArray[np.bool_] | None = None,
+    saturate_at: float | None = None,
 ) -> EndPointError:
     """Euclidean per-pixel error between two ``(2, H, W)`` displacement fields.
 
     ``valid`` excludes pixels with no ground truth -- those that map outside the target
     canvas. Scoring them would penalise a method for content it was never shown.
+
+    ``saturate_at`` clips the per-pixel error; callers pass :func:`diagonal` of the image and
+    that function explains why. ``None`` leaves the error unbounded, which is what the unit
+    tests measure against.
     """
     pred = np.asarray(predicted, dtype=np.float64)
     true = np.asarray(truth, dtype=np.float64)
@@ -66,24 +97,49 @@ def endpoint_error(
 
     if distance.size == 0:
         raise MetricError("no valid pixels to score; the pair has zero ground-truth overlap")
+
+    n_saturated = 0
+    if saturate_at is not None:
+        if saturate_at <= 0.0:
+            raise MetricError(f"saturate_at must be positive, got {saturate_at}")
+        # Non-finite entries (a pixel exactly on the horizon line) saturate too; `np.minimum`
+        # propagates NaN, so they are replaced rather than compared.
+        over = ~(distance <= saturate_at)
+        n_saturated = int(over.sum())
+        distance = np.where(over, saturate_at, distance)
+
     return EndPointError(
-        mean=float(distance.mean()), median=float(np.median(distance)), count=int(distance.size)
+        mean=float(distance.mean()),
+        median=float(np.median(distance)),
+        count=int(distance.size),
+        n_saturated=n_saturated,
     )
 
 
-def corner_error(predicted: FloatArray, truth: FloatArray, shape: tuple[int, int]) -> float:
+def corner_error(
+    predicted: FloatArray,
+    truth: FloatArray,
+    shape: tuple[int, int],
+    saturate: bool = False,
+) -> float:
     """Mean distance between the four image corners under ``predicted`` and under ``truth``.
 
     This is the per-pair term; averaging it over a dataset is MACE. It is the standard
     homography metric precisely because it is invariant to how the two matrices are scaled,
     which a direct matrix comparison is not.
+
+    ``saturate`` clips each corner's displacement to the image diagonal, for the reason
+    :func:`diagonal` gives. Off by default so the unit tests measure the raw quantity; the
+    evaluation cell turns it on.
     """
     reference = corners(shape)
-    return float(
-        np.linalg.norm(
-            warp_points(reference, predicted) - warp_points(reference, truth), axis=1
-        ).mean()
+    distance = np.linalg.norm(
+        warp_points(reference, predicted) - warp_points(reference, truth), axis=1
     )
+    if saturate:
+        bound = diagonal(shape)
+        distance = np.where(~(distance <= bound), bound, distance)
+    return float(distance.mean())
 
 
 def auc(errors: Sequence[float] | NDArray[np.floating], threshold: float) -> float:

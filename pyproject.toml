@@ -1,0 +1,127 @@
+[project]
+name = "cmreg"
+version = "0.1.0"
+description = "Cross-modal optical-thermal image registration: benchmark, dense error prediction, and CM-RoMa"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Atick Faisal", email = "atickfaisal@gmail.com" }
+]
+dependencies = [
+    "numpy>=2.0",
+    "pillow>=11.0",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    # Capped below 2.13.0/0.28.0: download.pytorch.org's index is missing the sha256
+    # fragment for torchvision-0.28.0+cu130's win_amd64/cp312 wheel (every version from
+    # 0.24.0 through 0.27.1 has one) -- uv's hash verification fails on the Windows server
+    # with a hash mismatch as a result. 2.12.1/0.27.1 is the latest pair confirmed to have
+    # proper hashes on both wheels for cu130/win_amd64/cp312.
+    "torch>=2.12.1,<2.13.0",
+    "torchvision>=0.27.1,<0.28.0",
+    "wandb>=0.28.1",
+    # Homography estimation (USAC_MAGSAC et al.), warping, and the preprocessing catalogue.
+    # opencv-python rather than -headless: figure generation may want the GUI codecs, and
+    # nothing here runs in a container. PLAN.md 4.1.
+    "opencv-python>=4.13",
+    # Spearman rank correlation (PLAN.md 6.2/6.3), TPS warping, and Nelder-Mead for the
+    # legacy MI baseline.
+    "scipy>=1.14",
+    # The per-pair results store. PLAN.md 12 / TASKS.md 0: W&B Tables degrade past a few
+    # tens of thousands of rows and the benchmark produces millions, so the source of truth
+    # is local Parquet and W&B only gets summaries.
+    "pandas>=2.2",
+    "pyarrow>=18.0",
+]
+
+# torch/torchvision are declared here as well so that `--extra cpu` / `--extra gpu`
+# selects the matching index below. Exactly one must be chosen at sync time.
+[project.optional-dependencies]
+cpu = [
+    # Capped below 2.13.0/0.28.0 -- see the main dependencies list above for why.
+    "torch>=2.12.1,<2.13.0",
+    "torchvision>=0.27.1,<0.28.0",
+]
+gpu = [
+    # Capped below 2.13.0/0.28.0 -- see the main dependencies list above for why.
+    "torch>=2.12.1,<2.13.0",
+    "torchvision>=0.27.1,<0.28.0",
+]
+
+[project.scripts]
+cmreg = "cmreg.cli:main"
+
+[dependency-groups]
+dev = [
+    "prek>=0.4.13",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.2",
+]
+
+# Conflicting extras + explicit indices are what let CPU-on-Mac and CUDA-on-Windows
+# resolve from a single uv.lock. Ported from ../Thermal-To-Optical-Translation.
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cmreg"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "scripts", "tests"]
+# ruff formats fenced Python inside markdown, and PLAN.md quotes upstream source verbatim
+# with `file:line` citations -- reformatting those breaks the citation. `ruff check .` /
+# `ruff format .` walk the filesystem directly and are not limited by `src`'s
+# import-classification-only role.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The repo root on sys.path, so tests can `import tests.conftest` for the fixture's stem
+# lists, and so a future `scripts/` (which has no console-script entry point, unlike the
+# installed `cmreg` package) is importable from a test.
+pythonpath = ["."]
+markers = [
+    "slow: long-running tests (matcher smoke runs, end-to-end benchmark cells); deselect with -m 'not slow'",
+]

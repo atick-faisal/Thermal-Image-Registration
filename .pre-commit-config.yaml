@@ -1,0 +1,26 @@
+# Run with `prek`. Ruff, pyright and the fast tests are the only things verifiable on the
+# dev machine: no dataset and no matcher weights exist here, so every test runs on
+# synthetic data built by `tests/conftest.py` (see .gitignore's `dataset/` note).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # Run through uv so the hooks see the project venv rather than prek's isolated one.
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pytest-fast
+        name: pytest (fast)
+        entry: uv run pytest -m "not slow" -q
+        language: system
+        types: [python]
+        pass_filenames: false

@@ -1,0 +1,10 @@
+* text=auto
+
+# The training machine is native Windows with CUDA 13 (PLAN.md §8). Pinning LF on the
+# files we edit from both machines keeps diffs free of whole-file CRLF churn.
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

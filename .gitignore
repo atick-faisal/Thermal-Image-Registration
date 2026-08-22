@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+.venv/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Run outputs. Configs reach the training server via git; results must not come back
+# through it. `experiments/` (tracked YAML) and `splits/` (tracked JSON) are the
+# deliberate counterparts of this line.
+runs/
+wandb/
+logs/
+
+# Weights — never committed, not in the fixture and not anywhere else
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Datasets — never tracked, no exceptions, not even a smoke fixture.
+# This remote is intended to be PUBLIC and the optical/thermal pairs are unpublished
+# research data (PLAN.md §12). Consequence: tests must not depend on committed images.
+# Build synthetic pairs with `tmp_path_factory`, and skip any test wanting the real
+# fixture when it is absent.
+dataset/
+
+# Working documents, kept local. PLAN.md carries the research design and an index of
+# internal reference implementations; TASKS.md is the task board built on it. Neither
+# belongs in a public repo as it stands. AGENTS.md describes the workflow that uses them.
+PLAN.md
+TASKS.md
+
+# OS / editor / agent
+.DS_Store
+.idea/
+.vscode/
+.claude/

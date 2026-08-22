@@ -1,0 +1,28 @@
+# The CPU-in-seconds smoke experiment. Every section is present and nothing is left to an
+# implicit default, so this file always shows the full config surface -- a section that only
+# appears when someone needs it is a section nobody knows exists.
+runtime:
+  device: cpu
+  name: smoke
+  path: runs/smoke
+  wandb: false
+  wandb_project: cmreg-bench
+  group: ""
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  limit: 8              # a smoke run, not a measurement
+
+gt:
+  seed: 0
+  rotation_deg: 30.0
+  scale_min: 0.8
+  scale_max: 1.25
+  perspective: 0.05
+  translation: 0.05
+
+eval:
+  thresholds_px: [3.0, 5.0, 10.0]
+  domain: driving
+  platform: public

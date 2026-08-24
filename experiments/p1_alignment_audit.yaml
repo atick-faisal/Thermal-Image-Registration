@@ -1,0 +1,89 @@
+# P1-1a: how pre-registered are the "pre-registered" benchmarks, in pixels?
+#
+# TASKS.md P1-3 says to verify each public set is actually pre-registered -- "spot-check,
+# don't trust the README". This config is that check, and it needs no new code: it is the one
+# evaluation path (AGENTS.md) run with a **zero-magnitude** Tier-1 warp.
+#
+# With every `gt` range at its identity value, `sample_homography` returns exactly I, the
+# dense GT field is zero over a fully-valid mask, and `corner_error(estimate.h, I)` is
+# therefore the dataset's *own* residual cross-modal misalignment -- not the matcher's error
+# against a synthetic warp. Because it runs through the same cell as every benchmark row, the
+# number is directly comparable with them.
+#
+# Why it matters: on the P3-7 smoke cell every matcher bottomed out near 5 px corner error --
+# `roma` 5.08, `superpoint-lightglue` 4.94, `eloftr` 6.57 -- including matchers 10x worse on
+# average. A floor that does not move with matcher quality is not matcher error, and the
+# direction convention is already pinned by
+# `tests/test_runner.py::test_identical_modalities_register_to_subpixel`. This config decides
+# whether that floor belongs to the data, and so whether `reg/auc_3px` is attainable on these
+# datasets at all -- a P3-1 question that has to be settled before the full grid runs.
+#
+# On the two things that could have made this measure the pipeline rather than the data:
+#   1. The moving image still goes through `warpPerspective` with H = I. **Measured, not
+#      assumed:** the round trip is bit-exact -- max absolute pixel difference 0 over 20 MSRS
+#      thermal images -- so the identity warp contributes no resampling error at all, and
+#      staying on the single evaluation path costs nothing.
+#   2. The residual is measured *under the benchmark's own preprocessing recipe*
+#      (invert/percentile), which is the operating point every other row uses. This one is a
+#      real choice, not a nuisance: it is the number the benchmark actually lives with.
+#
+# Run once per dataset, overriding only the manifest and the output location:
+#   uv run cmreg bench -c experiments/p1_alignment_audit.yaml \
+#       --data dataset/processed/<name>/data.yaml --name p1_audit_<name> \
+#       --run-dir runs/p1_audit_<name>
+runtime:
+  device: cpu
+  name: p1_audit
+  path: runs/p1_audit
+  wandb: false
+  wandb_project: cmreg-bench
+  group: p1_alignment_audit
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  # 50 pairs: enough that a per-dataset median is not one pair's accident, small enough that
+  # RoMa's ~20 s/pair on Mac CPU keeps the whole five-dataset sweep inside an hour.
+  limit: 50
+
+# The identity warp. Every one of these is the neutral element of its axis; changing any of
+# them turns this from an audit of the data into a benchmark of the matchers.
+gt:
+  seed: 0
+  moving: thermal
+  rotation_deg: 0.0
+  scale_min: 1.0
+  scale_max: 1.0
+  perspective: 0.0
+  translation: 0.0
+
+preprocess:
+  reference: invert
+  moving: percentile
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1
+  moving_interpolation: bicubic
+
+match:
+  # Three matchers spanning three decades of cost, deliberately. If the residual were a
+  # property of the *method*, these would disagree; if it is a property of the *data*, they
+  # will agree, and that agreement is the evidence.
+  matchers: [superpoint-lightglue, eloftr, roma]
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
+
+eval:
+  # A tighter ladder than the benchmark's 3/5/10: this run is asking whether a dataset is
+  # aligned to sub-pixel, and 3 px is already the answer "no" for that question.
+  thresholds_px: [1.0, 2.0, 3.0]
+  domain: driving
+  platform: public

@@ -24,6 +24,13 @@ from cmreg.config.schema import Estimator, Variant
 
 logger = logging.getLogger("cmreg")
 
+# Where dataset bytes live: the sibling tree that already holds MSRS and FLIR-aligned, so that
+# every optical-thermal set on this machine sits in one place rather than one per project.
+# This repo keeps only the pointer manifests under `dataset/processed/<name>/data.yaml`.
+DATASET_ROOT = Path(
+    "/Users/ai/.GoogleDrive/Python/Iberdrola/Thermal-To-Optical-Translation/dataset"
+)
+
 _VARIANTS = [v.value for v in Variant]
 
 # flag name -> dotted path into the config. See convention 2 above.
@@ -125,6 +132,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.set_defaults(handler=_run_report)
 
+    ingest = subparsers.add_parser(
+        "ingest", help="adapt a raw public dataset and write its pointer manifest"
+    )
+    ingest.add_argument("dataset", nargs="?", help="dataset name (see --list)")
+    ingest.add_argument(
+        "--dataset-root",
+        dest="dataset_root",
+        type=Path,
+        default=DATASET_ROOT,
+        help=f"tree holding raw/ and processed/ (default: {DATASET_ROOT})",
+    )
+    ingest.add_argument(
+        "--manifest-dir",
+        dest="manifest_dir",
+        type=Path,
+        default=Path("dataset/processed"),
+        help="where to write this repo's pointer data.yaml (default: dataset/processed)",
+    )
+    ingest.add_argument("--list", action="store_true", help="show the inventory table and exit")
+    ingest.set_defaults(handler=_run_ingest)
+
     matchers = subparsers.add_parser("matchers", help="list the registered matchers")
     matchers.set_defaults(handler=_run_matchers)
 
@@ -215,6 +243,75 @@ def _run_report(args: argparse.Namespace) -> int:
     if len(summaries) > 1:
         print(render_comparison(summaries, COMPARISON_KEYS))
     return 0
+
+
+def _run_ingest(args: argparse.Namespace) -> int:
+    """Adapt one raw dataset, or list what is already adapted.
+
+    The dataset bytes live in ``--dataset-root`` (the sibling tree that already holds MSRS and
+    FLIR-aligned); this repo keeps only a pointer ``data.yaml``. That root is a flag rather
+    than a config field for the reason ``cmreg/device.py`` records for the device: it differs
+    between the Mac and the Windows training box, and an experiment's ``config_hash()`` must
+    not depend on where its files happen to sit.
+    """
+    from cmreg.data import DatasetManifest
+    from cmreg.data.adapters import adapt, available, write_pointer_manifest
+
+    processed = args.dataset_root / "processed"
+    if args.list:
+        rows = []
+        for name in sorted({*available(), *(p.name for p in _adapted_dirs(processed))}):
+            manifest = args.manifest_dir / name / "data.yaml"
+            if not manifest.is_file():
+                rows.append((name, "-", "-", "not ingested"))
+                continue
+            loaded = DatasetManifest.load(manifest)
+            rows.append(
+                (
+                    name,
+                    str(len(loaded.images("train"))),
+                    str(len(loaded.images("val"))),
+                    str(loaded.root),
+                )
+            )
+        width = max(len(row[0]) for row in rows)
+        print(f"{'dataset':<{width}}  {'train':>7}  {'val':>7}  location")
+        for name, train, val, where in rows:
+            print(f"{name:<{width}}  {train:>7}  {val:>7}  {where}")
+        return 0
+
+    if not args.dataset:
+        logger.error("ingest needs a dataset name, or --list; known: %s", ", ".join(available()))
+        return 1
+
+    inventory = adapt(
+        args.dataset, args.dataset_root / "raw" / args.dataset, processed / args.dataset
+    )
+    manifest = write_pointer_manifest(
+        args.manifest_dir / inventory.name / "data.yaml", processed / inventory.name
+    )
+    # Load it back rather than trusting the write: the pointer is the only thing standing
+    # between an adapted tree and every downstream run, and a manifest that does not resolve
+    # would otherwise surface as "no images in the 'val' split" much later.
+    loaded = DatasetManifest.load(manifest)
+    loaded.pairing.validate_pairs(loaded.images("val"))
+
+    logger.info(
+        "%s: %d train + %d val pairs at %s [%s/%s]%s",
+        inventory.name,
+        inventory.train_pairs,
+        inventory.val_pairs,
+        inventory.resolution,
+        inventory.domain,
+        inventory.platform,
+        f" -- {inventory.note}" if inventory.note else "",
+    )
+    logger.info("manifest: %s -> %s", manifest, loaded.root)
+    return 0
+
+
+def _adapted_dirs(processed: Path) -> list[Path]:
+    return sorted(p for p in processed.iterdir() if p.is_dir()) if processed.is_dir() else []
 
 
 def _run_matchers(args: argparse.Namespace) -> int:

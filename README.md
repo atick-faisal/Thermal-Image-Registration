@@ -59,10 +59,19 @@ needs a file transfer:
 The per-pair Parquet store stays on the machine that produced it. It is the substrate the
 Phase-8 aggregator reads, not a thing anyone has to move.
 
-### Pointing at a dataset
+### Getting a dataset
 
-`dataset/` is git-ignored wholesale, so each machine writes its own manifest. For the MSRS
-copy already adapted by the sibling `Thermal-To-Optical-Translation` project:
+Fetch, then adapt. Both are one command each:
+
+```sh
+uv run python scripts/fetch_datasets.py --dataset dronevehicle llvip   # into <root>/raw/
+uv run cmreg ingest dronevehicle                                       # into <root>/processed/
+uv run cmreg ingest --list                                             # the inventory table
+```
+
+Dataset bytes live in one tree shared with the sibling `Thermal-To-Optical-Translation`
+project (`--dataset-root`), so every optical-thermal set on a machine sits in one place. This
+repo keeps only a pointer manifest per dataset, which `cmreg ingest` generates:
 
 ```yaml
 # dataset/processed/msrs/data.yaml
@@ -74,8 +83,10 @@ rgbt:
   thermal_token: infrared
 ```
 
-The `rgbt` tokens name the *path segment* that distinguishes the two modalities; pairing
-substitutes one for the other rather than zipping two sorted directory listings.
+`dataset/` is git-ignored wholesale, so those pointers never travel through git -- which is
+why they are generated rather than committed. The `rgbt` tokens name the *path segment* that
+distinguishes the two modalities; pairing substitutes one for the other rather than zipping
+two sorted directory listings.
 
 ## Workflow
 

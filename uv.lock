@@ -539,6 +539,9 @@ gpu = [
 matchers = [
     { name = "vismatch" },
 ]
+scripts = [
+    { name = "gdown" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -551,6 +554,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "gdown", marker = "extra == 'scripts'", specifier = ">=5.2" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python", specifier = ">=4.13" },
     { name = "pandas", specifier = ">=2.2" },
@@ -568,7 +572,7 @@ requires-dist = [
     { name = "vismatch", marker = "extra == 'matchers'", specifier = ">=1.2.0" },
     { name = "wandb", specifier = ">=0.28.1" },
 ]
-provides-extras = ["cpu", "gpu", "matchers"]
+provides-extras = ["cpu", "gpu", "matchers", "scripts"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -61,6 +61,14 @@ matchers = [
     # ../Thermal-Image-Research/uv.lock). Re-check on every version bump.
     "vismatch>=1.2.0",
 ]
+# `scripts/fetch_datasets.py` only. Optional because fetching is a one-time, per-machine
+# operation: the Windows server reads the datasets a Mac already adapted, and pulling a
+# Google-Drive client into the training environment would be dependency weight nothing there
+# ever calls. Failure mode: `uv sync` without it makes the fetch script exit at its `import
+# gdown`, which is the intended message rather than a silent skip of two datasets.
+scripts = [
+    "gdown>=5.2",
+]
 
 [project.scripts]
 cmreg = "cmreg.cli:main"

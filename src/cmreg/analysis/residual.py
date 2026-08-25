@@ -95,6 +95,20 @@ class ResidualStructure:
     # offset is a pure translation (four equal vectors) or carries scale/rotation, which is the
     # difference between a fixed baseline and a mounting error.
     corner_shift: tuple[tuple[float, float], ...]
+    # The consensus read as physics rather than as eight numbers. Measured on FLIR-aligned val,
+    # `rotation_deg` is -1.18: the split shipped as pre-registered carries a fixed camera roll.
+    # On MSRS it is ~0 with `scale` at 0.987/0.983, a ~1.5% field-of-view contraction instead.
+    # Reported here rather than derived downstream because the printed block is how a result
+    # reaches the Mac from the training server, and a corner table cannot be eyeballed into a
+    # rotation.
+    rotation_deg: float
+    # Singular values of the affine part: the two principal stretch factors. Equal and below 1
+    # is an FOV contraction; unequal is an aspect/shear mismatch.
+    scale: tuple[float, float]
+    # Translation at the image *centre*, in pixels. At the origin -- a corner -- a translation is
+    # inseparable from the rotation and scale about the centre, so measuring it there would
+    # report a shift that is not one.
+    centre_shift: tuple[float, float]
 
 
 def _residuals(rows: Sequence[PairRow]) -> tuple[FloatArray, tuple[int, int]]:
@@ -159,6 +173,7 @@ def residual_structure(rows: Sequence[PairRow]) -> ResidualStructure:
     scatter = float(np.mean([corner_error(m, consensus, shape, saturate=True) for m in matrices]))
     reference = corners(shape)
     shift = warp_points(reference, consensus) - reference
+    rotation_deg, scale, centre_shift = _decompose(consensus, shape)
 
     return ResidualStructure(
         dataset=rows[0].dataset,
@@ -173,6 +188,32 @@ def residual_structure(rows: Sequence[PairRow]) -> ResidualStructure:
         # has magnitude 0, and the ratio is then 0/0 rather than a finding.
         systematic_fraction=float("nan") if magnitude == 0.0 else 1.0 - scatter / magnitude,
         corner_shift=tuple((float(dx), float(dy)) for dx, dy in shift),
+        rotation_deg=rotation_deg,
+        scale=scale,
+        centre_shift=centre_shift,
+    )
+
+
+def _decompose(
+    consensus: FloatArray, shape: tuple[int, int]
+) -> tuple[float, tuple[float, float], tuple[float, float]]:
+    """Split the consensus into rotation, principal scales and a centre translation.
+
+    The affine part is polar-decomposed via its SVD: ``A = (U Vt) (V S Vt)`` splits it into a
+    rotation and a symmetric stretch, which is the decomposition that survives the two being
+    combined in either order. The projective row is deliberately not reported -- on all four
+    audited datasets it is O(1e-5) and describes nothing physical at this magnitude.
+    """
+    normalised = consensus / consensus[2, 2]
+    u, singular, vt = np.linalg.svd(normalised[:2, :2])
+    rotation = u @ vt
+    height, width = shape
+    centre = np.array([[width / 2.0, height / 2.0]], dtype=np.float64)
+    shifted = warp_points(centre, normalised) - centre
+    return (
+        float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0]))),
+        (float(singular[0]), float(singular[1])),
+        (float(shifted[0, 0]), float(shifted[0, 1])),
     )
 
 
@@ -203,6 +244,15 @@ def render(structure: ResidualStructure) -> str:
     lines.append(rule)
     for name, (dx, dy) in zip(_CORNER_NAMES, structure.corner_shift, strict=True):
         lines.append(f"{'  shift ' + name:<{_KEY_WIDTH}}{dx:+8.3f}, {dy:+8.3f}")
+    lines.append(rule)
+    lines.append(f"{'consensus rotation deg':<{_KEY_WIDTH}}{structure.rotation_deg:+.4f}")
+    lines.append(
+        f"{'consensus scale':<{_KEY_WIDTH}}{structure.scale[0]:.5f} / {structure.scale[1]:.5f}"
+    )
+    lines.append(
+        f"{'consensus centre px':<{_KEY_WIDTH}}"
+        f"{structure.centre_shift[0]:+.3f}, {structure.centre_shift[1]:+.3f}"
+    )
     lines.append(rule)
     lines.append(f"{'reading':<{_KEY_WIDTH}}{verdict}")
     lines.append("=== END ===")

@@ -150,3 +150,66 @@ def test_a_clean_dataset_reports_a_median_matching_its_mean() -> None:
     assert structure.magnitude_median == pytest.approx(structure.magnitude)
     assert "tail-dominated" not in render(structure)
     assert "systematic" in render(structure)
+
+
+def test_a_pure_rotation_is_reported_as_a_rotation() -> None:
+    """The FLIR case. A corner table cannot be eyeballed into a roll angle, so the block
+    reports the angle and this pins that it is the angle actually applied."""
+    theta = np.radians(-1.18)
+    cx, cy = SHAPE[1] / 2.0, SHAPE[0] / 2.0
+    cos, sin = float(np.cos(theta)), float(np.sin(theta))
+    # A rotation about the image centre, so the centre shift is zero and the angle is isolated.
+    roll = [
+        cos,
+        -sin,
+        cx - cos * cx + sin * cy,
+        sin,
+        cos,
+        cy - sin * cx - cos * cy,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    structure = residual_structure(
+        [
+            make_row(str(i), matcher="roma", h=roll, height=SHAPE[0], width=SHAPE[1])
+            for i in range(8)
+        ]
+    )
+
+    assert structure.rotation_deg == pytest.approx(-1.18, abs=1e-3)
+    assert structure.scale[0] == pytest.approx(1.0, abs=1e-6)
+    assert structure.scale[1] == pytest.approx(1.0, abs=1e-6)
+    # 1e-3 rather than exact zero: `consensus_homography` refits through
+    # `cv2.getPerspectiveTransform`, which is float32, so an exact-zero shift comes back at
+    # ~3e-06 px. Nine orders of magnitude below any threshold in PLAN.md §6.1.
+    assert structure.centre_shift == pytest.approx((0.0, 0.0), abs=1e-3)
+
+
+def test_an_fov_contraction_is_reported_as_a_scale() -> None:
+    """The MSRS case, and the one the rotation must *not* absorb: all four corners move inward
+    with no roll at all."""
+    factor = 0.985
+    cx, cy = SHAPE[1] / 2.0, SHAPE[0] / 2.0
+    zoom = [factor, 0.0, cx * (1 - factor), 0.0, factor, cy * (1 - factor), 0.0, 0.0, 1.0]
+    structure = residual_structure(
+        [
+            make_row(str(i), matcher="roma", h=zoom, height=SHAPE[0], width=SHAPE[1])
+            for i in range(8)
+        ]
+    )
+
+    assert structure.rotation_deg == pytest.approx(0.0, abs=1e-6)
+    assert structure.scale[0] == pytest.approx(factor, abs=1e-6)
+    # 1e-3 rather than exact zero: `consensus_homography` refits through
+    # `cv2.getPerspectiveTransform`, which is float32, so an exact-zero shift comes back at
+    # ~3e-06 px. Nine orders of magnitude below any threshold in PLAN.md §6.1.
+    assert structure.centre_shift == pytest.approx((0.0, 0.0), abs=1e-3)
+
+
+def test_a_pure_translation_carries_no_rotation_or_scale() -> None:
+    structure = residual_structure(_rows([(5.0, 3.0)] * 8))
+
+    assert structure.rotation_deg == pytest.approx(0.0, abs=1e-9)
+    assert structure.scale[0] == pytest.approx(1.0, abs=1e-9)
+    assert structure.centre_shift == pytest.approx((5.0, 3.0), abs=1e-6)

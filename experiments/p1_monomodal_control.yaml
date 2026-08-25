@@ -1,0 +1,94 @@
+# P1-1b: the mono-modal control -- what is the pipeline's own floor?
+#
+# Sibling of `p1_alignment_audit.yaml`, and only meaningful beside it. That config measured,
+# with a zero-magnitude warp, that MSRS/FLIR/LLVIP carry a 4-6 px residual cross-modal
+# misalignment and DroneVehicle ~59 px, and that the number belongs to the data rather than to
+# the matcher. It deliberately stopped short of one thing: it cannot say whether the pipeline
+# itself -- warp engine, matcher, estimator, metric -- is even capable of sub-pixel accuracy at
+# the operating point the benchmark uses. If it is not, the audit measured its own floor.
+#
+# This config removes the modality gap and asks exactly that. `gt.reference` is set equal to
+# `gt.moving` on the command line, so both sides of every pair are read from **one** modality
+# and the moving side is a known warp of the reference side. Nothing is left to fail except the
+# machinery.
+#
+#   sub-pixel here  -> the machinery is exact; P1-1a's 4-6 px is real and belongs to the data
+#   4-6 px here     -> the floor is the pipeline's, and P1-1a's reading needs revising (X-4)
+#
+# Run both modalities. They answer different questions: optical-vs-optical is the well-textured
+# best case, thermal-vs-thermal asks whether low-contrast 640x512 thermal imagery can be
+# localised to sub-pixel *at all* -- which, if it cannot, is a finding in its own right and a
+# hard bound on everything Phase 6 hopes to predict.
+#
+#   for d in msrs dronevehicle; do for m in optical thermal; do
+#     uv run cmreg bench -c experiments/p1_monomodal_control.yaml \
+#       --data dataset/processed/$d/data.yaml --reference $m --moving $m \
+#       --name p1b_mono_${d}_${m} --run-dir runs/p1b_mono_${d}_${m}
+#   done; done
+runtime:
+  device: cpu
+  name: p1b_mono
+  path: runs/p1b_mono
+  wandb: false
+  wandb_project: cmreg-bench
+  group: p1b_monomodal_control
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  # 50, matching the audit exactly: the two runs are read against each other, and a control
+  # over a different sample of pairs would not be a control.
+  limit: 50
+
+gt:
+  seed: 0
+  # `moving` and `reference` are overridden per cell on the command line. Left at the
+  # benchmark's default here so that running this file unmodified is a cross-modal run, not a
+  # silently-mislabelled control -- a config whose *default* is the control is one stray
+  # `-c` away from a benchmark table full of pipeline floors.
+  moving: thermal
+  # The benchmark's own Tier-1 warp, NOT the audit's identity. At identity a mono-modal pair is
+  # byte-identical and the cell measures nothing at all. At these ranges the number is directly
+  # comparable with P3-7's smoke cell (`roma` reg/mace 12.56 on MSRS) and with every future
+  # benchmark row.
+  rotation_deg: 30.0
+  scale_min: 0.8
+  scale_max: 1.25
+  perspective: 0.05
+  translation: 0.05
+
+preprocess:
+  # `none` on both sides, and this is the one place this config departs from the audit's
+  # recipe deliberately. Both sides are the same modality here, so the benchmark's
+  # invert/percentile asymmetry would apply a polarity flip to one copy of an image and not to
+  # the other -- manufacturing exactly the modality gap the control exists to remove.
+  reference: none
+  moving: none
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1
+  moving_interpolation: bicubic
+
+match:
+  # Two matchers spanning two paradigms, for the reason the audit gives: a floor that is a
+  # property of the *pipeline* is one they share, a floor that is a property of the *matcher*
+  # is one they disagree on. `roma` is the benchmark's leader and `superpoint-lightglue` is a
+  # sparse detector at 1/7 the cost.
+  matchers: [roma, superpoint-lightglue]
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
+
+eval:
+  # The audit's tighter ladder, not the benchmark's 3/5/10: the question here is whether the
+  # pipeline reaches sub-pixel, and 3 px is already "no" for that.
+  thresholds_px: [1.0, 2.0, 3.0]
+  domain: driving
+  platform: public

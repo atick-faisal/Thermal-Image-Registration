@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cmreg import __version__
-from cmreg.config.schema import Estimator, Variant
+from cmreg.config.schema import Estimator, Modality, Variant
 
 logger = logging.getLogger("cmreg")
 
@@ -32,6 +32,7 @@ DATASET_ROOT = Path(
 )
 
 _VARIANTS = [v.value for v in Variant]
+_MODALITIES = [m.value for m in Modality]
 
 # flag name -> dotted path into the config. See convention 2 above.
 _OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -43,6 +44,8 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "split": ("data", "split"),
     "limit": ("data", "limit"),
     "seed": ("gt", "seed"),
+    "moving": ("gt", "moving"),
+    "reference": ("gt", "reference"),
     "matchers": ("match", "matchers"),
     "estimator": ("estimate", "method"),
     "threshold": ("estimate", "threshold_px"),
@@ -80,6 +83,15 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--split", choices=("train", "val"))
     parser.add_argument("--limit", type=int, help="cap the number of pairs (0 = all)")
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--moving", choices=_MODALITIES, help="which modality receives the synthetic warp"
+    )
+    parser.add_argument(
+        "--reference",
+        choices=_MODALITIES,
+        help="reference modality (default: the other one; equal to --moving is the P1-1b "
+        "mono-modal control)",
+    )
     parser.add_argument(
         "--matchers",
         type=_comma_separated,
@@ -131,6 +143,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="corner-error thresholds in pixels for AUC and success rate",
     )
     report.set_defaults(handler=_run_report)
+
+    residual = subparsers.add_parser(
+        "residual",
+        help="decompose an identity-warp run's residual into its systematic and random parts",
+    )
+    residual.add_argument("run_dir", type=Path, help="a run directory, or a .parquet file")
+    residual.set_defaults(handler=_run_residual)
 
     ingest = subparsers.add_parser(
         "ingest", help="adapt a raw public dataset and write its pointer manifest"
@@ -242,6 +261,23 @@ def _run_report(args: argparse.Namespace) -> int:
         print(render(summary))
     if len(summaries) > 1:
         print(render_comparison(summaries, COMPARISON_KEYS))
+    return 0
+
+
+def _run_residual(args: argparse.Namespace) -> int:
+    """TASKS.md P1-1b. Only meaningful on an identity-warp run -- see `analysis/residual.py`,
+    which states that precondition and why the rows alone cannot enforce it."""
+    from cmreg.analysis.residual import AnalysisError, by_matcher, render
+    from cmreg.results import read_rows
+
+    rows = read_rows(args.run_dir)
+    try:
+        structures = by_matcher(rows)
+    except AnalysisError as exc:
+        logger.error("%s: %s", args.run_dir, exc)
+        return 1
+    for structure in structures:
+        print(render(structure))
     return 0
 
 

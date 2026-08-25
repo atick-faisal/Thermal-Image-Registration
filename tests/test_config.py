@@ -97,3 +97,23 @@ def test_impossible_values_are_rejected(section: str, payload: dict, message: st
 def test_deep_merge_leaves_untouched_keys_alone() -> None:
     merged = deep_merge({"a": {"x": 1, "y": 2}, "b": 3}, {"a": {"y": 9}})
     assert merged == {"a": {"x": 1, "y": 9}, "b": 3}
+
+
+def test_the_reference_modality_defaults_to_the_other_side() -> None:
+    """`None` means "whichever one `moving` is not". Two callers deriving that separately is
+    how a benchmark quietly starts registering an image against itself."""
+    from cmreg.config import Modality
+
+    assert Config().gt.reference_modality is Modality.OPTICAL
+    assert not Config().gt.is_monomodal
+    flipped = Config.model_validate({"gt": {"moving": "optical"}})
+    assert flipped.gt.reference_modality is Modality.THERMAL
+    assert not flipped.gt.is_monomodal
+
+
+def test_a_monomodal_config_is_a_different_experiment() -> None:
+    """`reference` is scientific, so it is inside `config_hash()`: a control cell and the
+    benchmark cell it controls for must not share a fingerprint (TASKS.md P1-1b)."""
+    control = Config.model_validate({"gt": {"reference": "thermal", "moving": "thermal"}})
+    assert control.gt.is_monomodal
+    assert control.config_hash() != Config().config_hash()

@@ -6,9 +6,9 @@ This module is that path.
 
 Protocol
 --------
-The public benchmarks are *pre-registered*: optical and thermal are already pixel-aligned, so
-the true cross-modal homography between them is the identity. Tier-1 ground truth is
-manufactured by breaking that alignment with a known warp (PLAN.md §5):
+Tier-1 ground truth assumes the two modalities of a pair *start* aligned, so that the true
+cross-modal homography between them is the identity, and manufactures a known misalignment by
+breaking it with a sampled warp (PLAN.md §5):
 
 1. Sample ``H_gt`` for pair *i* from ``(seed, i)`` -- the same derivation ``cmreg gt`` uses,
    so a bench run and its GT file agree by construction rather than by coincidence.
@@ -19,6 +19,18 @@ manufactured by breaking that alignment with a known warp (PLAN.md §5):
    backwards is the single most likely error in the whole pipeline -- which is why
    ``tests/test_runner.py`` pins it end to end with a same-modality pair rather than only
    unit-testing the pieces.
+
+**That assumption is false on the public benchmarks, by enough to matter** (TASKS.md P1-1a).
+MSRS, FLIR-aligned and LLVIP each carry a 4-6 px residual `R` of their own and DroneVehicle
+~59 px, so the true correspondence is `H_gt . R` rather than `H_gt` and `R` is a systematic
+floor under every number this module produces. It is measured by running this same cell with a
+zero-magnitude warp (`experiments/p1_alignment_audit.yaml`), which is why `h` is persisted per
+row: `analysis/residual.py` decomposes those residuals, and P3-1 chooses how to handle `R`
+from what it finds. Nothing here compensates for `R` yet.
+
+The two modalities are also chosen independently (`gt.reference` / `gt.moving`). Setting them
+to the *same* modality is the P1-1b mono-modal control: the pair's own residual is gone by
+construction, and what the cell then measures is its own floor rather than the data's.
 
 Loop order is pairs-outer, matchers-inner: decoding, warping and preprocessing depend only on
 the config, so doing them once per pair rather than once per (pair, matcher) is the difference
@@ -114,6 +126,14 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
         config.data.split,
         device,
     )
+    if config.gt.is_monomodal:
+        # Said out loud, because the numbers a control produces look like an implausibly good
+        # benchmark row and the only thing distinguishing them is this configuration.
+        logger.warning(
+            "MONO-MODAL CONTROL: both sides are %s; this is a pipeline floor (TASKS.md P1-1b), "
+            "not a cross-modal benchmark result",
+            config.gt.moving.value,
+        )
 
     rows: list[PairRow] = []
     identity = _identity_columns(config, manifest)
@@ -157,6 +177,7 @@ def _identity_columns(config: Config, manifest: DatasetManifest) -> dict[str, ob
         "threshold_px": config.estimate.threshold_px,
         "warp": WARP_MODEL,
         "moving": config.gt.moving.value,
+        "reference": config.gt.reference_modality.value,
         "seed": config.gt.seed,
         "config_hash": config.config_hash(),
         "git_sha": git_sha(),
@@ -188,9 +209,11 @@ def _load_pair(
         )
         return None
 
-    reference, moving = (
-        (optical, thermal) if config.gt.moving is Modality.THERMAL else (thermal, optical)
-    )
+    # A lookup rather than a two-way conditional, because reference and moving are chosen
+    # independently: setting them to the same modality is the P1-1b mono-modal control.
+    by_modality = {Modality.OPTICAL: optical, Modality.THERMAL: thermal}
+    reference = by_modality[config.gt.reference_modality]
+    moving = by_modality[config.gt.moving]
     shape = reference.shape
 
     homography = sample_homography(config.gt, generator(config.gt.seed, index), shape)
@@ -266,6 +289,8 @@ def _row(
 
     return PairRow(
         stem=pair.stem,
+        height=pair.shape[0],
+        width=pair.shape[1],
         matcher=matcher,
         success=estimate.h is not None,
         failure_reason=failure_reason,
@@ -273,6 +298,9 @@ def _row(
         corner_err=corner_err,
         epe_mean=epe_mean,
         epe_median=epe_median,
+        # Row-major, matching `cmreg gt`'s JSON convention. `None` on failure keeps the
+        # nullable columns null exactly when `success` is False (results/store.py).
+        h=None if estimate.h is None else [float(v) for v in estimate.h.ravel()],
         n_detected_ref=result.n_detected0,
         n_detected_mov=result.n_detected1,
         n_matches=len(result),
@@ -293,6 +321,9 @@ def _failed_row(stem: str, matcher: str, identity: dict[str, object], reason: st
     """A row for a pair that never reached the matcher."""
     return PairRow(
         stem=stem,
+        # Null: this row exists because the pair could not be decoded, so there is no shape.
+        height=None,
+        width=None,
         matcher=matcher,
         success=False,
         failure_reason=reason,
@@ -300,6 +331,7 @@ def _failed_row(stem: str, matcher: str, identity: dict[str, object], reason: st
         corner_err=None,
         epe_mean=None,
         epe_median=None,
+        h=None,
         n_detected_ref=None,
         n_detected_mov=None,
         n_matches=0,

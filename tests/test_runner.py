@@ -246,3 +246,98 @@ def test_a_cell_does_not_depend_on_which_matchers_share_its_config(
         base_config(manifest, tmp_path / "with", match={"matchers": ["sift", "_stochastic_alone"]})
     )
     assert _scientific(accompanied.metrics) == _scientific(alone.metrics)
+
+
+# --- TASKS.md P1-1b: the alignment audit and the mono-modal control -----------------------
+
+# Every `gt` range at its neutral element, so `sample_homography` returns exactly I and the
+# recovered homography is the pair's own residual misalignment. This is what
+# `experiments/p1_alignment_audit.yaml` encodes; duplicated here so the test fails if the
+# meaning of "identity warp" ever drifts from what that config assumes.
+IDENTITY_WARP = {
+    "rotation_deg": 0.0,
+    "scale_min": 1.0,
+    "scale_max": 1.0,
+    "perspective": 0.0,
+    "translation": 0.0,
+}
+
+
+def test_the_identity_warp_audit_recovers_a_known_camera_offset(
+    offset_dataset: Path, tmp_path: Path
+) -> None:
+    """The pin for P1-1a's *method*, which nothing previously asserted.
+
+    P1-1a concluded that MSRS/FLIR/LLVIP carry a 4-6 px residual by running this cell with a
+    zero-magnitude warp and reading `corner_error(estimate.h, I)` as the dataset's own
+    misalignment. That reading is only sound if the cell actually reports a known offset as
+    that offset -- so here the fixture's rig displacement is known to the pixel, and the run
+    has to return it.
+    """
+    from tests.conftest import OFFSET_PX
+
+    config = base_config(offset_dataset / "data.yaml", tmp_path / "audit", gt=IDENTITY_WARP)
+    (summary,) = run_benchmark(config)
+    assert summary.n_failed == 0
+    assert summary.metrics["reg/mace"] == pytest.approx(float(np.hypot(*OFFSET_PX)), abs=0.1)
+
+
+def test_the_monomodal_control_is_subpixel_where_the_cross_modal_cell_is_not(
+    offset_dataset: Path, tmp_path: Path
+) -> None:
+    """TASKS.md P1-1b's control, and the pin that ``gt.reference`` changes which file is read.
+
+    Same pairs, same warp, one field apart: cross-modal carries the fixture's rig offset,
+    mono-modal cannot, because both sides come from the one camera. A `reference` field that
+    was accepted but ignored would make these two numbers equal.
+    """
+    from tests.conftest import OFFSET_PX
+
+    manifest = offset_dataset / "data.yaml"
+    cross = run_benchmark(base_config(manifest, tmp_path / "cross", gt=IDENTITY_WARP))[0]
+    mono = run_benchmark(
+        base_config(
+            manifest,
+            tmp_path / "mono",
+            gt={**IDENTITY_WARP, "reference": "optical", "moving": "optical"},
+        )
+    )[0]
+    assert cross.metrics["reg/mace"] == pytest.approx(float(np.hypot(*OFFSET_PX)), abs=0.1)
+    assert mono.metrics["reg/mace"] < SUBPIXEL_PX
+
+
+def test_the_monomodal_control_survives_a_real_warp(offset_dataset: Path, tmp_path: Path) -> None:
+    """The control as it is actually run: at the benchmark's own Tier-1 warp, not at identity.
+
+    At identity a mono-modal pair is byte-identical and the cell measures nothing. The
+    question P1-1b asks of it -- is the pipeline sub-pixel-capable at the operating point every
+    benchmark row uses? -- only has an answer under a real warp.
+    """
+    config = base_config(
+        offset_dataset / "data.yaml", tmp_path / "warped", gt={"reference": "thermal"}
+    )
+    assert config.gt.is_monomodal
+    (summary,) = run_benchmark(config)
+    assert summary.metrics["reg/mace"] < SUBPIXEL_PX
+
+
+def test_rows_carry_the_shape_and_the_estimated_homography(
+    offset_dataset: Path, tmp_path: Path
+) -> None:
+    """Both are additions the residual decomposition cannot work without, and both are null
+    exactly when a row failed."""
+    from cmreg.metrics import corner_error
+
+    config = base_config(offset_dataset / "data.yaml", tmp_path / "cols", gt=IDENTITY_WARP)
+    (summary,) = run_benchmark(config)
+    rows = read_rows(tmp_path / "cols")
+    assert summary.n_failed == 0
+    for row in rows:
+        assert (row.height, row.width) == (240, 320)
+        assert row.h is not None and row.height is not None and row.width is not None
+        # The stored matrix has to reproduce the row's own corner error, or the column is
+        # recording something other than the fit that was scored.
+        recovered = corner_error(
+            np.asarray(row.h).reshape(3, 3), np.eye(3), (row.height, row.width)
+        )
+        assert row.corner_err == pytest.approx(recovered, abs=1e-6)

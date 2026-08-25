@@ -130,3 +130,62 @@ def aligned_dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
         )
     )
     return root
+
+
+# --- the offset fixture ----------------------------------------------------------------
+#
+# The two fixtures above cannot express the thing TASKS.md P1-1b measures. `aligned_dataset`
+# has *identical* modalities, so a mono-modal control and a cross-modal cell read the same
+# pixels and the flag under test has no observable effect; `dataset_root` is uniform noise and
+# unmatchable by construction. This one stands in for a real capture rig: both modalities show
+# the same scene, but the second camera is mounted a known number of pixels off.
+
+OFFSET_PX = (5, 3)  # (dx, dy) -- the thermal camera's fixed displacement, in pixels
+_OFFSET_MARGIN = 16  # crop inset, comfortably larger than the offset in both axes
+
+
+@pytest.fixture(scope="session")
+def offset_dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A dataset whose modalities are two crops of one image, offset by :data:`OFFSET_PX`.
+
+    Two overlapping crops rather than a shifted copy: a roll wraps content around the border
+    and a pad invents it, and either would give the matcher edge structure that does not obey
+    the transform the fixture claims to encode. Both crops here are wholly real content, and
+    the exact relative transform between them is a translation by ``(dx, dy)``.
+
+    Optical pixel ``(x, y)`` and thermal pixel ``(x - dx, y - dy)`` are the same scene point,
+    so the map from thermal into optical -- the direction the evaluation cell estimates -- is a
+    translation by ``(+dx, +dy)`` and the dataset's own residual misalignment is exactly
+    ``hypot(dx, dy)`` px.
+    """
+    root = tmp_path_factory.mktemp("offset")
+    rng = np.random.default_rng(11)
+    height, width = TEXTURED_SIZE
+    dx, dy = OFFSET_PX
+    margin = _OFFSET_MARGIN
+
+    for split, stems in (("train", TEXTURED_STEMS[:2]), ("val", TEXTURED_STEMS[2:])):
+        for stem in stems:
+            scene = textured_image(rng, (height + 2 * margin, width + 2 * margin))
+            crops = {
+                "optical": scene[margin : margin + height, margin : margin + width],
+                "thermal": scene[
+                    margin + dy : margin + dy + height, margin + dx : margin + dx + width
+                ],
+            }
+            for modality, crop in crops.items():
+                directory = root / split / modality / "images"
+                directory.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(crop, mode="L").save(directory / f"{stem}.png")
+
+    (root / "data.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "path": ".",
+                "train": "train/optical/images",
+                "val": "val/optical/images",
+                "rgbt": {"optical_token": "optical", "thermal_token": "thermal"},
+            }
+        )
+    )
+    return root

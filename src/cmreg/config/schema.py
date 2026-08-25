@@ -161,6 +161,13 @@ class GTConfig(ConfigBase):
     # thermal is typically the lower-resolution, harder side, so warping optical instead
     # makes every number look better for no methodological reason.
     moving: Modality = Modality.THERMAL
+    # Which modality is the reference frame. `None` means "whichever one `moving` is not" --
+    # the cross-modal benchmark, and what every run before TASKS.md P1-1b did. Setting it
+    # *equal* to `moving` is the mono-modal control: both sides are read from one modality, so
+    # the pair's own cross-modal offset is gone and what is left is the floor of the pipeline
+    # itself. Failure mode: left equal to `moving` by accident, and a control cell is filed as
+    # a benchmark row roughly an order of magnitude too good.
+    reference: Modality | None = None
     # Rotation half-range in degrees (PLAN.md §5 Tier 1: +/-30 deg). Widening it past what
     # any matcher tolerates turns the whole benchmark into a floor of failures.
     rotation_deg: float = 30.0
@@ -189,6 +196,19 @@ class GTConfig(ConfigBase):
         if value < 0.0:
             raise ValueError(f"must be >= 0, got {value}")
         return value
+
+    @property
+    def reference_modality(self) -> Modality:
+        """The resolved reference side. A property so no caller re-derives the default and
+        two of them end up disagreeing about what `None` meant."""
+        if self.reference is not None:
+            return self.reference
+        return Modality.OPTICAL if self.moving is Modality.THERMAL else Modality.THERMAL
+
+    @property
+    def is_monomodal(self) -> bool:
+        """True when both sides come from the same modality (the P1-1b control)."""
+        return self.reference_modality is self.moving
 
 
 class EvalConfig(ConfigBase):

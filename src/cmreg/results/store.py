@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 FILENAME = "pairs.parquet"
 
+# A 3x3 homography, row-major -- the convention `cmreg gt` already writes into `gt_*.json`.
+_HOMOGRAPHY_ENTRIES = 9
+
 
 class ResultsError(ValueError):
     """Raised when a results file is missing, empty, or does not match the declared schema."""
@@ -52,6 +55,12 @@ class PairRow:
     split: str
     domain: str
     platform: str
+    # The reference image's size, in pixels. Carried because nothing spatial is recomputable
+    # from this file without it -- `corner_error` and `diagonal` both need the shape, and the
+    # aggregator has no image to ask (TASKS.md P1-1b). Null only for a pair that could not be
+    # decoded at all, which is the one case where there is no shape to record.
+    height: int | None
+    width: int | None
     matcher: str
     preprocess_ref: str
     preprocess_mov: str
@@ -61,6 +70,9 @@ class PairRow:
     threshold_px: float
     warp: str
     moving: str
+    # The reference modality. Without it a mono-modal control row (TASKS.md P1-1b, where both
+    # sides come from one modality) is indistinguishable from a benchmark row in this file.
+    reference: str
     seed: int
     config_hash: str
     git_sha: str
@@ -77,6 +89,15 @@ class PairRow:
     corner_err: float | None
     epe_mean: float | None
     epe_median: float | None
+    # The estimated homography, row-major 9 floats -- the same convention `cmreg gt` writes
+    # into `gt_*.json` (`cli.py::_run_gt`). Null exactly when `success` is False.
+    #
+    # Stored because a corner error is lossy: it says how far the fit was, never in which
+    # direction. TASKS.md P1-1b needs the direction to tell a fixed rig miscalibration (every
+    # pair sharing one offset) from a cross-modal localisation limit (per-pair scatter), and
+    # P3-1's "estimate R per pair and compose it into the GT" option cannot be implemented at
+    # all without it. ~72 B/row, against having to re-run every matcher to recover it.
+    h: list[float] | None
     # Null when the matcher reports no detection count: a dense matcher has no detection
     # stage, and `vismatch`'s interface cannot tell that apart from a detector that fired on
     # nothing (`matchers/vismatch_backend.py::_detected`). `0` therefore keeps meaning
@@ -92,6 +113,13 @@ class PairRow:
     estimate_ms: float
     total_ms: float
 
+    def __post_init__(self) -> None:
+        # The width guarantee the Arrow type cannot carry; see `_ARROW_TYPES` for why.
+        if self.h is not None and len(self.h) != _HOMOGRAPHY_ENTRIES:
+            raise ResultsError(
+                f"h must be {_HOMOGRAPHY_ENTRIES} row-major floats, got {len(self.h)}"
+            )
+
 
 _ARROW_TYPES: dict[str, pa.DataType] = {
     "str": pa.string(),
@@ -101,6 +129,14 @@ _ARROW_TYPES: dict[str, pa.DataType] = {
     "float": pa.float64(),
     "float | None": pa.float64(),
     "bool": pa.bool_(),
+    # Variable-size, though a homography is always 9 floats. `pa.list_(pa.float64(), 9)` is
+    # the honest type and it *cannot be used*: Parquet has no fixed-size-list logical type, so
+    # a null is written as a zero-length list and `pq.read_table` then rejects its own file
+    # with "Expected all lists to be of size=9 but index N had size=0". Nulls are not the
+    # exception here -- every failed pair has one. The width is enforced in
+    # `PairRow.__post_init__` instead, which catches a malformed row earlier than the writer
+    # would have anyway.
+    "list[float] | None": pa.list_(pa.float64()),
 }
 
 

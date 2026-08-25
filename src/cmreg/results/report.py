@@ -108,6 +108,10 @@ def summarize(rows: Sequence[PairRow], thresholds_px: Sequence[float]) -> Summar
             f"x{first.upsample} {first.interpolation}"
         ),
         "warp": first.warp,
+        # Both sides, always: when they name the same modality the block is a P1-1b
+        # mono-modal control and not a cross-modal benchmark row, and a pasted block has
+        # nothing else to say so.
+        "reference": first.reference,
         "moving": first.moving,
         "dataset": f"{first.dataset} [{first.split}]",
         "domain": first.domain,

@@ -19,6 +19,11 @@ up where it stopped. Windows-safe -- the CLI is called in-process, not through a
     uv run python scripts/p1c_full_residual.py
     uv run python scripts/p1c_full_residual.py --datasets flir msrs
 
+Needs a GPU. `--device` defaults to `cuda` and `resolve_device` raises rather than falling back,
+which is the intended behaviour: RoMa measured 23.9 s/pair on a Mac CPU, so the two FLIR cells
+alone would take ~34 h there against roughly an hour on a GPU. Pass `--device cpu` only to
+deliberately accept that.
+
 A dataset with no pointer `data.yaml` is **skipped with the command that would produce it**,
 not treated as an error. The four sets do not arrive by one route: `llvip` and `dronevehicle`
 have adapters in this repo, while `msrs` and `flir` are converted by the sibling project and
@@ -87,7 +92,7 @@ _HOW_TO_INGEST = {
 }
 
 
-def run(cell: Cell) -> None:
+def run(cell: Cell, device: str) -> None:
     run_dir = Path("runs") / cell.name
     banner = f"########## {cell.name} -- {cell.why} ##########"
     if not cell.manifest.exists():
@@ -115,7 +120,7 @@ def run(cell: Cell) -> None:
                 "--matchers",
                 MATCHER,
                 "--device",
-                "cuda",
+                device,
                 "--wandb",
                 "--name",
                 cell.name,
@@ -133,6 +138,11 @@ def main_script(argv: list[str] | None = None) -> int:
     names = sorted({cell.dataset for cell in CELLS})
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--device",
+        default="cuda",
+        help="torch device; 'auto' picks the best available (default: cuda)",
+    )
+    parser.add_argument(
         "--datasets",
         nargs="+",
         choices=names,
@@ -144,7 +154,7 @@ def main_script(argv: list[str] | None = None) -> int:
     selected = [cell for cell in CELLS if cell.dataset in args.datasets]
     print(f"########## {len(selected)} cells: {', '.join(c.name for c in selected)} ##########")
     for cell in selected:
-        run(cell)
+        run(cell, args.device)
     print("\n########## DONE -- copy every block above ##########", flush=True)
     return 0
 

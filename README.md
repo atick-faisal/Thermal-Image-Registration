@@ -22,6 +22,34 @@ uv sync --extra gpu --extra matchers    # CUDA 13 training server
 `cpu` and `gpu` are declared as `conflicts` so uv resolves them from the same lockfile
 against different PyTorch indices. Syncing without one of them leaves torch unresolved.
 
+### `uv run` will undo the sync you just did
+
+`uv run` re-syncs the environment to the project's **default** state first, and an extra is
+never part of that default. On the CUDA server it therefore uninstalls the `cu130` torch that
+`uv sync --extra gpu` installed, replaces it with the CPU build, and the run dies in
+`resolve_device` with "torch reports no CUDA on this machine" — which is accurate by the time
+it is raised. The give-away is a bare `Uninstalled 2 packages / Installed 2 packages` printed
+before the traceback.
+
+uv offers no way to make extras sticky: there is no `default-extras` setting (only
+`default-groups`, which covers dependency groups) and `--extra` has no environment variable.
+So either pass them to every invocation:
+
+```sh
+uv run --extra gpu --extra matchers cmreg bench ...
+```
+
+or, better for a machine that only ever wants one configuration, pin the environment:
+
+```powershell
+$env:UV_NO_SYNC = "1"                                              # this shell
+[Environment]::SetEnvironmentVariable("UV_NO_SYNC", "1", "User")   # permanently
+```
+
+`UV_NO_SYNC` makes `uv run` use the venv exactly as `uv sync` left it. The cost is that a
+`git pull` adding a dependency is then silently ignored, so re-run `uv sync --extra gpu
+--extra matchers` after pulling.
+
 `matchers` is orthogonal to both and pulls in [`vismatch`][vismatch], which is the learned
 arm of the benchmark — RoMa, MINIMA, MatchAnything, LoFTR, LightGlue and the rest. It is
 optional because its transitive tree is large and the registry is built to tolerate its

@@ -12,6 +12,16 @@ Two questions this answers, in order of importance:
    which retires the whole plan for FLIR. This is the decisive cell and the reason for the run.
 2. Do the other datasets' residuals hold at full scale, and is DroneVehicle's 28% gross-failure
    rate (14 of 50) a stable property rather than a small-sample artefact?
+3. **P1-1d, added after the first run answered 1 and 2.** The FLIR roll is a rig constant
+   (-1.2823 deg on val, -1.2841 on train), but composing it still leaves 6.56 px of per-pair
+   scatter. That remainder is either real per-pair misalignment or roma's cross-modal
+   localisation limit, and a matcher swap on the same cell is the discriminator.
+
+Note both defaults this script exists to get right, because passing the config by hand gets them
+wrong: `p1_alignment_audit.yaml` carries `device: cpu` and `limit: 50` -- it was written for Mac
+CPU work -- so a hand-written `cmreg bench -c` against it silently measures 50 *consecutive*
+frames on the CPU. P1-1c is the record of what that costs: on a driving set 50 consecutive frames
+are one scene, and the scatter came back 3.6x too low.
 
 Resumable: a cell whose `pairs.parquet` already exists is skipped, so an interrupted run picks
 up where it stopped. Windows-safe -- the CLI is called in-process, not through a shell.
@@ -42,8 +52,10 @@ from pathlib import Path
 
 from cmreg.cli import main
 
-# RoMa alone: P1-1a already established that three matchers spanning three decades of cost agree
-# on FLIR to within 4%, so the cross-paradigm check is done and this run needs the accurate one.
+# RoMa is the default: P1-1a established that three matchers spanning three decades of cost agree
+# on FLIR's residual *magnitude* to within 4%, so for magnitude the cross-paradigm check is done
+# and this run needs the accurate one. P1-1d re-opens it for the *scatter*, which P1-1a never
+# measured -- hence `Cell.matcher` rather than one module-level constant.
 MATCHER = "roma"
 CONFIG = "experiments/p1_alignment_audit.yaml"
 
@@ -56,10 +68,14 @@ class Cell:
     # no precision -- 1,000 pairs already pins a mean to a few percent.
     limit: int
     why: str
+    matcher: str = MATCHER
 
     @property
     def name(self) -> str:
-        return f"p1c_residual_{self.dataset}_{self.split}"
+        # The matcher is in the name only when it is not the default, so every P1-1c run
+        # directory keeps the path it was already written to and stays skippable.
+        suffix = "" if self.matcher == MATCHER else f"_{self.matcher}"
+        return f"p1c_residual_{self.dataset}_{self.split}{suffix}"
 
     @property
     def manifest(self) -> Path:
@@ -72,6 +88,19 @@ CELLS = (
     Cell("msrs", "val", 0, "full split, 361 pairs"),
     Cell("llvip", "val", 1000, "capped; 1280x1024 and the slowest per pair"),
     Cell("dronevehicle", "val", 1000, "capped; is the 28% gross-failure rate stable?"),
+    # P1-1d. The consensus is settled; what is left is whether the 6.56 px of *scatter* on this
+    # exact cell is the data's (parallax -- a homography is exact for one depth plane, and a
+    # two-camera rig sees depth-dependent disparity) or roma's cross-modal localisation limit.
+    # A matcher swap separates them: parallax survives it, a localisation limit does not. Same
+    # dataset, split and limit as the roma cell above so the two scatters are directly
+    # comparable -- that comparability is the whole measurement.
+    Cell(
+        "flir",
+        "val",
+        0,
+        "P1-1d: is the 6.56 px scatter the data's or roma's? (1,013 pairs)",
+        matcher="superpoint-lightglue",
+    ),
 )
 
 
@@ -118,7 +147,7 @@ def run(cell: Cell, device: str) -> None:
                 "--limit",
                 str(cell.limit),
                 "--matchers",
-                MATCHER,
+                cell.matcher,
                 "--device",
                 device,
                 "--wandb",

@@ -101,6 +101,19 @@ CELLS = (
         "P1-1d: is the 6.56 px scatter the data's or roma's? (1,013 pairs)",
         matcher="superpoint-lightglue",
     ),
+    # The third leg, added after P1-1d. roma and splg agree on how *much* consensus there is
+    # (13%) and not on what it is made of -- 38% apart on rotation, opposite signs on the first
+    # principal scale. Their two consensus fields differ by 3.44 px, which is 84% of the scatter
+    # that difference has to be small against, so P3-1 cannot publish either one as the
+    # calibration. With a third matcher the across-matcher spread becomes a measured uncertainty
+    # to report beside the constant instead of a known-non-zero unknown.
+    Cell(
+        "flir",
+        "val",
+        0,
+        "P1-1d: third leg -- how far apart do three matchers put the consensus?",
+        matcher="eloftr",
+    ),
 )
 
 

@@ -60,10 +60,40 @@ under every Tier-1 number.
 scores that matcher against its own output. Only a dataset-level constant is admissible, and
 only where the scatter it leaves is small.
 
-Composition is **not implemented yet** — it needs a calibration-constant file and a `GTConfig`
-field, and is its own task. Stage A runs without it; that is legitimate because every stage-A
-row is a *comparison between matchers on one dataset*, and `R` is common to all of them.
-The absolute numbers are floors, and the file says so.
+### Composition, as implemented (P2-12)
+
+`gt.residual_calibration` names a constant under `calibration/`; the truth becomes
+`R . inv(H_gt)` while the moving image is still warped by `H_gt` alone, so only the *ground
+truth* changes and no pixel is resampled twice. The direction is pinned end to end by
+`tests/test_runner.py::test_composing_a_known_calibration_removes_the_offset` against a fixture
+whose rig displacement is known to the pixel — composed the other way round the error doubles
+rather than vanishing, and that is not a difference an eye catches in a table.
+
+The constant is produced by `cmreg calibrate` over identity-warp runs (one per matcher), which
+takes the element-wise median of their consensus corner fields — P1-1d's manual construction,
+now the command. It reads the stored `h` column and never a matcher, so a third leg costs
+seconds. `scripts/p3b_calibrate.py` is the server driver.
+
+| | status |
+|---|---|
+| `calibration/flir.json` | **published** — P1-1d's 1,013-pair three-matcher median, ±1.23 px mean / 2.33 px worst case |
+| `calibration/llvip.json` | **pending** — GRID.md marked `llvip` "compose" on 50 head-sliced pairs that P1-1c flagged as a provisional lower bound. `p3b_calibrate.py` measures it properly at 300 random pairs × 3 matchers before stage A re-runs |
+
+`scripts/p3a_grid.py` carries the policy per cell and **fails** a composing cell whose constant
+is absent rather than running it uncomposed: the two produce tables that look identical, and
+P3-7's F1 is the record of what an unnoticed floor costs.
+
+Measured on `flir` val, 50 random pairs, `eloftr`, identity warp — composition removes what it
+claims to and no more:
+
+| | uncomposed | composed |
+|---|---|---|
+| `reg/mace` | 13.10 | **8.62** |
+| `reg/epe_median` | 5.48 | **2.25** |
+| `reg/success_rate_3px` | 0.00 | **0.30** |
+
+The 3 px column moving off zero for the first time on this dataset is the point: what remains is
+the ~4-5 px of per-pair scatter P1-1d showed no calibration can remove.
 
 ## 4. Pair budget — 300 random, not a head slice
 

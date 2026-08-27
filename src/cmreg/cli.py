@@ -49,6 +49,7 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "seed": ("gt", "seed"),
     "moving": ("gt", "moving"),
     "reference": ("gt", "reference"),
+    "residual_calibration": ("gt", "residual_calibration"),
     "matchers": ("match", "matchers"),
     "estimator": ("estimate", "method"),
     "threshold": ("estimate", "threshold_px"),
@@ -113,6 +114,12 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         type=_comma_separated,
         help="comma-separated matcher names, e.g. 'sift,orb' (see `cmreg matchers`)",
     )
+    parser.add_argument(
+        "--residual-calibration",
+        dest="residual_calibration",
+        type=Path,
+        help="compose a dataset's residual R into the GT (calibration/<dataset>.json)",
+    )
     parser.add_argument("--estimator", choices=[e.value for e in Estimator])
     parser.add_argument("--threshold", type=float, help="estimator inlier threshold in pixels")
     parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
@@ -173,6 +180,35 @@ def build_parser() -> argparse.ArgumentParser:
     residual.add_argument("run_dir", type=Path, help="a run directory, or a .parquet file")
     residual.set_defaults(handler=_run_residual)
 
+    calibrate = subparsers.add_parser(
+        "calibrate",
+        help="publish a dataset's residual R as a calibration constant from identity-warp runs",
+    )
+    calibrate.add_argument(
+        "run_dir",
+        type=Path,
+        nargs="+",
+        help="identity-warp run directories (or .parquet files) to combine; every matcher "
+        "found across them becomes one leg of the median",
+    )
+    calibrate.add_argument(
+        "--out",
+        type=Path,
+        help="write the JSON here (default: calibration/<dataset>.json)",
+    )
+    calibrate.add_argument(
+        "--note",
+        default="",
+        help="provenance line stored in the file",
+    )
+    calibrate.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="print the block without writing the file",
+    )
+    calibrate.set_defaults(handler=_run_calibrate)
+
     ingest = subparsers.add_parser(
         "ingest", help="adapt a raw public dataset and write its pointer manifest"
     )
@@ -205,7 +241,13 @@ def _run_gt(args: argparse.Namespace) -> int:
 
     from cmreg.config import Config
     from cmreg.data import DatasetManifest, select_pairs
-    from cmreg.gt import dense_displacement, generator, overlap_ratio, sample_homography
+    from cmreg.gt import (
+        dense_displacement,
+        generator,
+        load_calibration,
+        overlap_ratio,
+        sample_homography,
+    )
     from cmreg.imaging import read_shape
 
     config = Config.load(args.config, overrides_from_args(args))
@@ -214,6 +256,12 @@ def _run_gt(args: argparse.Namespace) -> int:
     if not images:
         logger.error("no images in the '%s' split of %s", config.data.split, manifest.path)
         return 1
+
+    calibration = (
+        None
+        if config.gt.residual_calibration is None
+        else load_calibration(config.gt.residual_calibration)
+    )
 
     # The same selection `eval/runner.py` makes, so a GT file and the bench run that consumes
     # it cover the same pairs under the same warps -- by construction, not by coincidence.
@@ -245,6 +293,12 @@ def _run_gt(args: argparse.Namespace) -> int:
                 "config_hash": config.config_hash(),
                 "manifest": str(manifest.path),
                 "split": config.data.split,
+                # The dataset residual composed by a bench run reading this file (P2-12).
+                # `homography` below stays `H_gt` alone -- it is what the moving image is warped
+                # by, and the truth a consumer scores against is `R . inv(H_gt)`, derived. So
+                # the digest is recorded rather than folded in: a GT file that silently baked
+                # one constant in would be indistinguishable from one that baked in another.
+                "residual_calibration": None if calibration is None else calibration.digest(),
                 "pairs": records,
             },
             indent=2,
@@ -302,6 +356,102 @@ def _run_residual(args: argparse.Namespace) -> int:
     for structure in structures:
         print(render(structure))
     return 0
+
+
+def _run_calibrate(args: argparse.Namespace) -> int:
+    """TASKS.md P2-12. Publish a dataset's residual `R` as a constant several matchers agree on.
+
+    Reads stored Parquet only -- never a matcher. P1-1b persists each pair's fitted `h`
+    precisely so that this is a re-read of an existing audit rather than a second inference
+    run, which is what makes a third leg cost seconds instead of hours.
+
+    Same precondition as ``cmreg residual``: the runs must be identity-warp runs
+    (``experiments/p1_alignment_audit.yaml``), where `H_gt = I` and the recovered homography
+    *is* the pair's own residual. The rows cannot prove that; their config snapshot records it.
+    """
+    from cmreg.analysis.residual import AnalysisError, across_matchers, by_matcher
+    from cmreg.gt import ResidualCalibration, write_calibration
+    from cmreg.gt.calibration import CalibrationError
+    from cmreg.results import read_rows
+    from cmreg.tracking import git_sha
+
+    rows = [row for run_dir in args.run_dir for row in read_rows(run_dir)]
+    try:
+        structures = by_matcher(rows)
+        consensus = across_matchers(structures)
+    except AnalysisError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    splits = sorted({row.split for row in rows})
+    try:
+        calibration = ResidualCalibration(
+            dataset=consensus.dataset,
+            height=consensus.height,
+            width=consensus.width,
+            corner_shift=consensus.corner_shift,
+            matchers=consensus.matchers,
+            spread_px=consensus.spread_px,
+            worst_case_px=consensus.worst_case_px,
+            n_pairs=consensus.n_pairs,
+            split=",".join(splits),
+            git_sha=git_sha(),
+            note=args.note,
+        )
+    except CalibrationError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    print(_calibration_block(calibration, structures, consensus))
+    if args.dry_run:
+        logger.info("--dry-run: nothing written")
+        return 0
+    out = args.out or Path("calibration") / f"{calibration.dataset}.json"
+    write_calibration(calibration, out)
+    logger.info("wrote %s", out)
+    return 0
+
+
+def _calibration_block(calibration: Any, structures: Any, consensus: Any) -> str:
+    """The copy-pasteable console block, in ``analysis/residual.py::render``'s house shape.
+
+    The full JSON is printed inside it deliberately: the training server cannot return files
+    (PLAN.md's two-machine workflow), so a constant that does not survive a console copy is a
+    constant that never reaches the repo.
+    """
+    import json
+
+    from cmreg.gt import CORNER_NAMES
+
+    rule = "-" * 72
+    width = 26
+    lines = ["=== CMREG RESIDUAL CALIBRATION ===", rule]
+    lines.append(f"{'dataset':<{width}}{calibration.dataset}")
+    lines.append(f"{'shape':<{width}}{calibration.height}x{calibration.width}")
+    lines.append(f"{'split':<{width}}{calibration.split}")
+    lines.append(f"{'pairs (thinnest leg)':<{width}}{calibration.n_pairs}")
+    lines.append(f"{'digest':<{width}}{calibration.digest()}")
+    lines.append(rule)
+    lines.append(f"{'magnitude removed px':<{width}}{calibration.magnitude_px():.4f}")
+    lines.append(f"{'spread px (mean)':<{width}}{calibration.spread_px:.4f}")
+    lines.append(f"{'  worst case':<{width}}{calibration.worst_case_px:.4f}")
+    lines.append(rule)
+    for name, (dx, dy) in zip(CORNER_NAMES, calibration.corner_shift, strict=True):
+        lines.append(f"{'  shift ' + name:<{width}}{dx:+8.3f}, {dy:+8.3f}")
+    lines.append(rule)
+    # Per leg, because the spread is a summary and which matcher stands apart is the finding:
+    # P1-1d's three legs split 2-1 on the dense/sparse boundary, and that is visible only here.
+    for structure, distance in zip(structures, consensus.leg_distance_px, strict=True):
+        lines.append(
+            f"{'  leg ' + structure.matcher:<{width}}{distance:8.3f} px from the median   "
+            f"(n={structure.n_pairs}, scatter median {structure.scatter_median:.3f})"
+        )
+    if len(structures) == 1:
+        lines.append("  WARNING: one leg is a matcher's bias, not a calibration (P1-1d)")
+    lines.append(rule)
+    lines.append(json.dumps(calibration.to_dict(), indent=2))
+    lines.append("=== END ===")
+    return "\n".join(lines)
 
 
 def _run_ingest(args: argparse.Namespace) -> int:

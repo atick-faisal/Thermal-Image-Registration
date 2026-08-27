@@ -117,3 +117,21 @@ def test_a_monomodal_config_is_a_different_experiment() -> None:
     control = Config.model_validate({"gt": {"reference": "thermal", "moving": "thermal"}})
     assert control.gt.is_monomodal
     assert control.config_hash() != Config().config_hash()
+
+
+def test_composing_a_residual_is_a_different_experiment(tmp_path: Path) -> None:
+    """`gt.residual_calibration` is scientific, so it must move the hash.
+
+    A run that composes a rig constant into its ground truth is not the same measurement as one
+    that does not -- P3-7's F1 is the whole argument -- and two rows sharing a `config_hash`
+    across that boundary would be pooled as if they were replicates.
+    """
+    plain = Config.model_validate({})
+    composed = Config.model_validate({"gt": {"residual_calibration": str(tmp_path / "flir.json")}})
+    assert composed.config_hash() != plain.config_hash()
+
+
+def test_the_residual_calibration_defaults_to_none() -> None:
+    """Tier-1 as originally specified. Composition is opt-in per dataset (GRID.md §3): `msrs`
+    and `dronevehicle` must never compose, so the default cannot be "whatever file is there"."""
+    assert Config.model_validate({}).gt.residual_calibration is None

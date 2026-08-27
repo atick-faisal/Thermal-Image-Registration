@@ -22,11 +22,22 @@ breaking it with a sampled warp (PLAN.md §5):
 
 **That assumption is false on the public benchmarks, by enough to matter** (TASKS.md P1-1a).
 MSRS, FLIR-aligned and LLVIP each carry a 4-6 px residual `R` of their own and DroneVehicle
-~59 px, so the true correspondence is `H_gt . R` rather than `H_gt` and `R` is a systematic
-floor under every number this module produces. It is measured by running this same cell with a
-zero-magnitude warp (`experiments/p1_alignment_audit.yaml`), which is why `h` is persisted per
-row: `analysis/residual.py` decomposes those residuals, and P3-1 chooses how to handle `R`
-from what it finds. Nothing here compensates for `R` yet.
+~59 px, so the true correspondence is `R . inv(H_gt)` rather than `inv(H_gt)`. Left alone, `R`
+is a systematic floor under every number this module produces, and P3-7's stage-A run 1
+measured the cost: ten of twenty matchers scored `success_rate_5px` of exactly 0.0000 on
+`flir`, twelve of them piled into a 4.5-5.8 px band that is the dataset's residual rather than
+anything about them, and no cross-dataset row was comparable because the floors differ (5.9 vs
+4.7 px).
+
+So step 3 above composes a **dataset-level** calibration constant when `gt.residual_calibration`
+names one (TASKS.md P2-12, `gt/calibration.py`): the moving image is still warped by `H_gt`
+alone, and only the *truth* changes. Which datasets may compose is `experiments/GRID.md` §3's
+decision, not this module's, and a per-pair `R_i` is never admissible -- it comes from a
+matcher, so folding it in would score that matcher against its own output (P1-1b).
+
+`R` itself is measured by running this same cell with a zero-magnitude warp
+(`experiments/p1_alignment_audit.yaml`), which is why `h` is persisted per row:
+`analysis/residual.py` decomposes those residuals and `cmreg calibrate` publishes the constant.
 
 The two modalities are also chosen independently (`gt.reference` / `gt.moving`). Setting them
 to the *same* modality is the P1-1b mono-modal control: the pair's own residual is gone by
@@ -55,7 +66,15 @@ from cmreg.config import Config, Modality
 from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
 from cmreg.estimate import Estimate, EstimateError, estimate_homography
-from cmreg.gt import DenseGT, dense_displacement, generator, overlap_ratio, sample_homography
+from cmreg.gt import (
+    DenseGT,
+    ResidualCalibration,
+    dense_displacement,
+    generator,
+    load_calibration,
+    overlap_ratio,
+    sample_homography,
+)
 from cmreg.imaging import ImagingError, read_gray
 from cmreg.matchers import MatchResult, get_matcher
 from cmreg.metrics import corner_error, diagonal, endpoint_error
@@ -103,7 +122,8 @@ class _Pair:
     reference: GrayImage
     moving_warped: GrayImage
     # `H_gt` maps the moving image into the reference canvas; the matcher has to recover its
-    # inverse. Both are carried so nothing downstream has to remember which is which.
+    # inverse, composed with the dataset's residual `R` when one is configured. Both are
+    # carried so nothing downstream has to remember which is which.
     truth: np.ndarray
     gt_field: DenseGT
     overlap: float
@@ -125,6 +145,11 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
     # visible in its own log rather than only in a runtime column six hours later.
     device = resolve_device(config.runtime.device)
     matchers = {name: get_matcher(name, config.match, device) for name in config.match.matchers}
+    # Read once and validated here rather than per pair: a calibration naming the wrong dataset
+    # is a configuration error, identical on all 300 pairs, and should abort before the first
+    # matcher loads instead of writing 6000 rows that blame the data (the same reasoning that
+    # keeps `EstimateError` fatal below).
+    calibration = _load_calibration(config, manifest.path.parent.name)
     logger.info(
         "benchmarking %s over %d pairs of %s [%s] on %s",
         ", ".join(matchers),
@@ -143,9 +168,9 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
         )
 
     rows: list[PairRow] = []
-    identity = _identity_columns(config, manifest)
+    identity = _identity_columns(config, manifest, calibration)
     for position, (index, optical_path) in enumerate(selected):
-        pair = _load_pair(optical_path, manifest, config, index)
+        pair = _load_pair(optical_path, manifest, config, index, calibration)
         if pair is None:
             rows.extend(
                 _failed_row(optical_path.stem, name, identity, "unreadable_pair")
@@ -183,7 +208,47 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
     return summaries
 
 
-def _identity_columns(config: Config, manifest: DatasetManifest) -> dict[str, object]:
+def _load_calibration(config: Config, dataset: str) -> ResidualCalibration | None:
+    """Read the configured residual constant and check it describes this run.
+
+    The shape half of the check waits until the first pair is decoded (`_load_pair`); the
+    dataset half is answerable now, and answering it now is what turns "silently registered
+    against the wrong rig for six hours" into a startup error.
+    """
+    if config.gt.residual_calibration is None:
+        return None
+    if config.gt.is_monomodal:
+        # Both sides are read from one modality, so the pair's cross-modal offset is gone by
+        # construction (P1-1b) and there is nothing left for `R` to remove. Composing one here
+        # would *inject* the rig's misalignment into a control whose entire purpose is to
+        # measure the pipeline's own floor.
+        raise RunnerError(
+            "gt.residual_calibration is set on a mono-modal control; the pair's residual is "
+            "zero by construction there and composing a constant would manufacture one"
+        )
+    calibration = load_calibration(config.gt.residual_calibration)
+    if calibration.dataset != dataset:
+        raise RunnerError(
+            f"calibration {config.gt.residual_calibration} is for '{calibration.dataset}' but "
+            f"this run is on '{dataset}'"
+        )
+    logger.info(
+        "composing %s's residual into the ground truth: %.2f px over %d matchers (%s), "
+        "stated uncertainty %.2f px mean / %.2f px worst case [%s]",
+        calibration.dataset,
+        calibration.magnitude_px(),
+        len(calibration.matchers),
+        ", ".join(calibration.matchers),
+        calibration.spread_px,
+        calibration.worst_case_px,
+        calibration.digest(),
+    )
+    return calibration
+
+
+def _identity_columns(
+    config: Config, manifest: DatasetManifest, calibration: ResidualCalibration | None
+) -> dict[str, object]:
     """The columns constant across every row of this run."""
     return {
         "dataset": manifest.path.parent.name,
@@ -201,13 +266,21 @@ def _identity_columns(config: Config, manifest: DatasetManifest) -> dict[str, ob
         "reference": config.gt.reference_modality.value,
         "seed": config.gt.seed,
         "config_hash": config.config_hash(),
+        # The constant's digest, not its path: `config_hash` already covers the configured
+        # path, and two different constants can share a filename across two machines. This is
+        # what makes a pasted table traceable to the exact matrix that produced it.
+        "residual_calibration": None if calibration is None else calibration.digest(),
         "git_sha": git_sha(),
         "run_name": config.runtime.name,
     }
 
 
 def _load_pair(
-    optical_path: Path, manifest: DatasetManifest, config: Config, index: int
+    optical_path: Path,
+    manifest: DatasetManifest,
+    config: Config,
+    index: int,
+    calibration: ResidualCalibration | None,
 ) -> _Pair | None:
     """Decode, warp and preprocess one pair. ``None`` when the pair cannot be used at all."""
     thermal_path = manifest.pairing.thermal_path(optical_path)
@@ -241,6 +314,17 @@ def _load_pair(
     try:
         moving_warped = np.asarray(apply_warp(moving, homography, out_shape=shape), np.uint8)
         truth = np.linalg.inv(homography)
+        if calibration is not None:
+            calibration.validate_for(manifest.path.parent.name, shape)
+            # `R . inv(H_gt)`, and the order is the whole of it. `R` maps moving-native pixels
+            # to reference pixels (that is what the identity-warp audit estimates, since there
+            # `H_gt = I` and the estimator runs src=moving, dst=reference). A warped-moving
+            # pixel `x'` is `inv(H_gt) x'` in moving-native, which lands at `R inv(H_gt) x'` in
+            # the reference. Writing `inv(H_gt . R)` instead would compose `R` in the opposite
+            # direction and *double* the misalignment rather than removing it -- which is why
+            # this is pinned by an oracle rather than by this comment
+            # (`tests/test_runner.py::test_composing_a_known_calibration_removes_the_offset`).
+            truth = calibration.homography() @ truth
     except (WarpError, np.linalg.LinAlgError):  # pragma: no cover - sample_homography validates
         logger.warning("%s: sampled homography is not usable", optical_path.stem)
         return None
@@ -252,6 +336,10 @@ def _load_pair(
         moving_warped=moving_warped,
         truth=truth,
         gt_field=dense_displacement(truth, shape),
+        # On `H_gt`, deliberately, and not on `inv(truth)`: overlap is "how much of the moving
+        # image the synthetic warp pushed off the canvas", a property of the warp this run
+        # applied. `R` is a handful of pixels of rig offset and folding it in here would make
+        # a composed run's overlap column incomparable with an uncomposed one for no gain.
         overlap=overlap_ratio(dense_displacement(homography, shape)),
     )
 

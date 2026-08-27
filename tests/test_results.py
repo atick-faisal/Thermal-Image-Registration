@@ -45,6 +45,7 @@ def make_row(
         reference="optical",
         seed=0,
         config_hash="0123456789abcdef",
+        residual_calibration=None,
         git_sha="deadbeef",
         run_name="unit",
         success=success,
@@ -192,3 +193,36 @@ def test_the_comparison_table_has_one_row_per_matcher() -> None:
     assert "orb" in table
     # Header columns must not abut, or the table is unreadable in a pasted block.
     assert "  " in table.splitlines()[1]
+
+
+def test_a_file_predating_a_nullable_column_reads_as_null(tmp_path: Path) -> None:
+    """Additive columns must not retroactively destroy every run on disk.
+
+    The project adds columns as it learns what to record -- `h` and the shape at TASKS.md
+    P1-1b, `residual_calibration` at P2-12 -- and each was declared `X | None` because the value
+    can be unknown. A file written before the column existed is the purest case of unknown, so
+    it is read as null rather than refused; P1-1b's promise that old runs "are still readable
+    and still correctly labelled with what produced them" is only true if this holds.
+    """
+    import pyarrow.parquet as pq
+
+    path = write_rows([make_row("a"), make_row("b")], tmp_path)
+    table = pq.read_table(path)
+    pq.write_table(table.drop_columns(["residual_calibration"]), path)
+
+    rows = read_rows(path)
+    assert len(rows) == 2
+    assert all(row.residual_calibration is None for row in rows)
+    # And nothing else was disturbed on the way through.
+    assert [row.stem for row in rows] == ["a", "b"]
+    assert rows[0].corner_err == pytest.approx(2.0)
+
+
+def test_a_file_missing_a_required_column_is_still_refused(tmp_path: Path) -> None:
+    """There is no honest value to invent for a non-nullable column, so this stays fatal."""
+    import pyarrow.parquet as pq
+
+    path = write_rows([make_row("a")], tmp_path)
+    pq.write_table(pq.read_table(path).drop_columns(["matcher"]), path)
+    with pytest.raises(ResultsError, match="matcher"):
+        read_rows(path)

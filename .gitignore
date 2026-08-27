@@ -15,8 +15,11 @@ wheels/
 htmlcov/
 
 # Run outputs. Configs reach the training server via git; results must not come back
-# through it. `experiments/` (tracked YAML) and `splits/` (tracked JSON) are the
-# deliberate counterparts of this line.
+# through it. `experiments/` (tracked YAML), `splits/` (tracked JSON) and
+# `calibration/` (tracked JSON) are the deliberate counterparts of this line -- a
+# published constant is an input to the next run, not a result of the last one, and it
+# reaches the repo by being copied out of a console block rather than by travelling
+# back with a run directory.
 runs/
 wandb/
 logs/

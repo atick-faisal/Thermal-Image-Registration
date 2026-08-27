@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from cmreg.analysis.residual import (
     AnalysisError,
+    MatcherConsensus,
     ResidualStructure,
+    across_matchers,
     by_matcher,
     consensus_homography,
     render,
@@ -18,7 +20,9 @@ from cmreg.analysis.residual import (
 
 __all__ = [
     "AnalysisError",
+    "MatcherConsensus",
     "ResidualStructure",
+    "across_matchers",
     "by_matcher",
     "consensus_homography",
     "render",

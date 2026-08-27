@@ -24,6 +24,7 @@ import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -75,6 +76,12 @@ class PairRow:
     reference: str
     seed: int
     config_hash: str
+    # Digest of the dataset residual `R` composed into this row's ground truth, or null for a
+    # run that composed none (TASKS.md P2-12). `config_hash` covers the configured *path*, and
+    # two different constants can share a filename across two machines; this is the column that
+    # ties a number to the exact matrix. It also makes a composed row impossible to confuse
+    # with a pre-composition one when the two sit in the same aggregate.
+    residual_calibration: str | None
     git_sha: str
     run_name: str
 
@@ -188,12 +195,29 @@ def read_rows(path: Path | str) -> tuple[PairRow, ...]:
         raise ResultsError(f"results file not found: {source}")
 
     table = pq.read_table(source)
-    names = [field.name for field in fields(PairRow)]
-    missing = [name for name in names if name not in table.column_names]
-    if missing:
-        raise ResultsError(f"{source}: missing columns {missing}; written by an older schema?")
-    records = table.select(names).to_pylist()
-    return tuple(PairRow(**record) for record in records)
+    declared = {field.name: str(field.type) for field in fields(PairRow)}
+    absent = [name for name in declared if name not in table.column_names]
+    # A **nullable** column absent from an older file is read as null rather than refused. The
+    # project adds columns as it learns what to record -- `h` and the shape at P1-1b,
+    # `residual_calibration` at P2-12 -- and every one of those was declared `X | None`
+    # precisely because the value can be unknown. A file written before the column existed is
+    # the purest case of unknown, so refusing it would make each addition retroactively destroy
+    # every run on disk, which is exactly what P1-1b promised additive columns would not do.
+    # A missing *non*-nullable column is still fatal: there is no honest value to invent.
+    fillable = [name for name in absent if "None" in declared[name]]
+    fatal = [name for name in absent if name not in fillable]
+    if fatal:
+        raise ResultsError(f"{source}: missing columns {fatal}; written by an older schema?")
+    if fillable:
+        logger.info(
+            "%s predates columns %s; reading them as null", source, ", ".join(sorted(fillable))
+        )
+    # Typed `dict[str, Any]`, not the `dict[str, None]` `fromkeys` infers, so that merging it
+    # into a record does not widen every field to `X | None` for the type checker.
+    blank: dict[str, Any] = dict.fromkeys(fillable)
+    present = [name for name in declared if name in table.column_names]
+    records = table.select(present).to_pylist()
+    return tuple(PairRow(**{**blank, **record}) for record in records)
 
 
 def concat(paths: Iterable[Path | str]) -> tuple[PairRow, ...]:

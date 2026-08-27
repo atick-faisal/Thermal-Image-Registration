@@ -53,6 +53,14 @@ class Cell:
     domain: str
     platform: str
     why: str
+    # Whether this dataset's residual `R` is composed into the Tier-1 GT (TASKS.md P2-12).
+    # Per dataset and carried from `experiments/GRID.md` §3, which is the one place that
+    # decision lives: `msrs` (13% systematic) and `dronevehicle` (1%) must not compose,
+    # because there the constant would be fitting noise. A dataset marked True whose
+    # `calibration/<name>.json` is missing **fails the cell** rather than quietly running
+    # uncomposed -- an uncomposed row looks exactly like a composed one in the table, and
+    # P3-7's F1 is the record of what a floor nobody noticed costs.
+    composes: bool
 
     @property
     def name(self) -> str:
@@ -61,6 +69,10 @@ class Cell:
     @property
     def manifest(self) -> Path:
         return Path("dataset/processed") / self.dataset / "data.yaml"
+
+    @property
+    def calibration(self) -> Path | None:
+        return Path("calibration") / f"{self.dataset}.json" if self.composes else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,14 +91,27 @@ class DryRun:
 
 
 CELLS = (
-    Cell("flir", "driving", "public", "the best-characterised set (P1-1c/d): 5.9 px residual"),
-    Cell("msrs", "driving", "public", "4.7 px residual, 13% systematic"),
-    Cell("llvip", "driving", "public", "night-time; where sparse detectors fail outright"),
+    Cell(
+        "flir",
+        "driving",
+        "public",
+        "the best-characterised set (P1-1c/d): 5.9 px residual, composed",
+        composes=True,
+    ),
+    Cell("msrs", "driving", "public", "4.7 px residual, 13% systematic", composes=False),
+    Cell(
+        "llvip",
+        "driving",
+        "public",
+        "night-time; where sparse detectors fail outright",
+        composes=True,
+    ),
     Cell(
         "dronevehicle",
         "aerial",
         "drone",
         "THE AERIAL CELL: 4.7 px median with a 28% gross-failure rate",
+        composes=False,
     ),
 )
 
@@ -118,6 +143,14 @@ def run(cell: Cell, device: str, dry: DryRun) -> bool:
             flush=True,
         )
         return False
+    if cell.calibration is not None and not cell.calibration.exists():
+        # Fatal, not a skip. GRID.md §3 marks this dataset "compose", and running it without
+        # the constant produces a table that looks identical and measures the rig.
+        raise SystemExit(
+            f"{cell.name}: {cell.calibration} is missing. GRID.md §3 marks {cell.dataset} as "
+            "composing its residual; produce the constant with "
+            f"`uv run python scripts/p3b_calibrate.py --datasets {cell.dataset}` first."
+        )
     if (run_dir / "pairs.parquet").exists():
         print(f"########## SKIP {cell.name} (already complete) ##########", flush=True)
         return True
@@ -144,6 +177,8 @@ def run(cell: Cell, device: str, dry: DryRun) -> bool:
     # Both overrides are deliberately absent unless asked for: the config's 300 pairs and its
     # 20-matcher list are scientific choices (GRID.md §1, §4), and a driver that restated
     # either could drift from it.
+    if cell.calibration is not None:
+        argv += ["--residual-calibration", str(cell.calibration)]
     if dry.limit is not None:
         argv += ["--limit", str(dry.limit)]
     if dry.matchers is not None:

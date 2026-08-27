@@ -1,0 +1,36 @@
+{
+  "dataset": "flir",
+  "height": 512,
+  "width": 640,
+  "corner_shift": [
+    [
+      0.58,
+      6.011
+    ],
+    [
+      -11.987,
+      0.893
+    ],
+    [
+      0.424,
+      -5.699
+    ],
+    [
+      13.489,
+      -0.117
+    ]
+  ],
+  "matchers": [
+    "roma",
+    "superpoint-lightglue",
+    "eloftr"
+  ],
+  "spread_px": 1.23,
+  "worst_case_px": 2.33,
+  "n_pairs": 1013,
+  "split": "val",
+  "git_sha": "739796f",
+  "note": "TASKS.md P1-1d. Element-wise median of three matchers' consensus corner fields over flir val (1,013 pairs, identity warp). Legs sit 0.21 (eloftr) / 1.16 (splg) / 2.33 (roma) px from it. Transcribed from the published table because the source Parquet is on the training server; scripts/p3b_calibrate.py re-derives it there as a check. Composing removes ~9.5 px and injects ~1.2 px of matcher-choice bias, against the ~4.1 px per-pair scatter that no calibration can remove.",
+  "digest": "210142740cdba163",
+  "magnitude_px": 9.315848121708807
+}

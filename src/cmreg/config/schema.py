@@ -188,6 +188,19 @@ class GTConfig(ConfigBase):
     # Translation as a fraction of image size. Combined with `perspective` this is what
     # controls how much of the source leaves the frame.
     translation: float = 0.05
+    # The dataset's own residual cross-modal misalignment `R`, as a published calibration
+    # constant under `calibration/` (TASKS.md P2-12). `None` -- the default -- is Tier-1 as
+    # originally specified, where the true correspondence is assumed to be `H_gt` alone and
+    # `R` is left as a systematic floor under every number the run produces. Set it and the
+    # truth becomes `R . inv(H_gt)`.
+    #
+    # Two failure modes, both fatal by design rather than absorbed (`gt/calibration.py`):
+    # a constant composed for the *wrong dataset* removes an offset that was never there and
+    # adds one that is, and a corner field measured at one resolution is silently the wrong
+    # size at another. `experiments/GRID.md` §3 holds which datasets may compose at all --
+    # `msrs` and `dronevehicle` must not, because at 13% and 1% systematic the composition
+    # would be fitting noise.
+    residual_calibration: Path | None = None
 
     @model_validator(mode="after")
     def _scale_range_ordered(self) -> Self:

@@ -70,6 +70,11 @@ class ResidualStructure:
 
     dataset: str
     matcher: str
+    # The shape `corner_shift` is expressed in. A corner field without it is unusable -- the
+    # same four displacements mean a different warp at a different resolution -- and
+    # `_residuals` already refuses a group whose rows disagree about it.
+    height: int
+    width: int
     # Successful rows only. A failed fit has no residual to decompose; the count is reported
     # so a decomposition over a handful of survivors is visibly that (TASKS.md X-4).
     n_pairs: int
@@ -188,6 +193,8 @@ def residual_structure(rows: Sequence[PairRow]) -> ResidualStructure:
     return ResidualStructure(
         dataset=rows[0].dataset,
         matcher=rows[0].matcher,
+        height=shape[0],
+        width=shape[1],
         n_pairs=len(matrices),
         n_failed=len(rows) - len(matrices),
         magnitude=magnitude,
@@ -299,3 +306,78 @@ def _verdict(structure: ResidualStructure) -> str:
     if fraction <= _RANDOM_AT:
         return "random -- per-pair, i.e. the cross-modal localisation limit"
     return "mixed -- report both parts, do not label it"
+
+
+@dataclass(frozen=True, slots=True)
+class MatcherConsensus:
+    """One dataset's residual as several matchers jointly see it (TASKS.md P1-1d).
+
+    :func:`residual_structure` takes a median across *pairs* to give one matcher's ``R_bar``.
+    This is that construction applied one level up, across *matchers*, and it exists because
+    P1-1d measured that a single leg is not a calibration: roma's consensus field sat 3.44 px
+    from superpoint-lightglue's and 2.50 px from eloftr's, which is 84% of the 4.09 px per-pair
+    scatter the constant is supposed to be small against. The three-way median is 1.23 px from
+    its furthest leg -- 30% of that scatter -- so what the extra legs buy is a **measured**
+    uncertainty in place of one known only to be non-zero.
+    """
+
+    dataset: str
+    matchers: tuple[str, ...]
+    height: int
+    width: int
+    corner_shift: tuple[tuple[float, float], ...]
+    # Each leg's mean corner distance from the published median, in the order of `matchers`.
+    leg_distance_px: tuple[float, ...]
+    # The pairs the *thinnest* leg contributed, not the total: the constant is only as well
+    # evidenced as its least-supported witness, and summing would flatter a three-leg estimate
+    # by counting the same 300 pairs three times.
+    n_pairs: int
+
+    @property
+    def spread_px(self) -> float:
+        return float(np.mean(self.leg_distance_px))
+
+    @property
+    def worst_case_px(self) -> float:
+        return float(np.max(self.leg_distance_px))
+
+
+def across_matchers(structures: Sequence[ResidualStructure]) -> MatcherConsensus:
+    """Combine several matchers' consensus fields into the one published constant.
+
+    Works on the corner *shifts* rather than the matrices, for the reason
+    :func:`consensus_homography` gives, and the distances need no refit: both fields displace
+    the same four reference corners, so a leg's ``corner_error`` against the median is exactly
+    the mean norm of the difference of their shifts.
+    """
+    if not structures:
+        raise AnalysisError("cannot combine zero matchers")
+    datasets = {s.dataset for s in structures}
+    if len(datasets) != 1:
+        raise AnalysisError(f"cannot combine matchers across datasets: {sorted(datasets)}")
+    shapes = {(s.height, s.width) for s in structures}
+    if len(shapes) != 1:
+        raise AnalysisError(f"cannot combine matchers across shapes: {sorted(shapes)}")
+    if len(structures) == 1:
+        # Permitted, because a one-leg field is the only thing a single-matcher run can offer
+        # and it is still the right shape to inspect. Loud, because publishing it as a
+        # calibration would ship that matcher's bias as a dataset constant.
+        logger.warning(
+            "consensus over a single matcher (%s): this is that matcher's bias, not a "
+            "calibration -- P1-1d measured legs up to 3.44 px apart",
+            structures[0].matcher,
+        )
+
+    shifts = np.array([s.corner_shift for s in structures], dtype=np.float64)
+    median = np.median(shifts, axis=0)
+    distances = tuple(float(np.linalg.norm(shift - median, axis=1).mean()) for shift in shifts)
+    height, width = shapes.pop()
+    return MatcherConsensus(
+        dataset=structures[0].dataset,
+        matchers=tuple(s.matcher for s in structures),
+        height=height,
+        width=width,
+        corner_shift=tuple((float(dx), float(dy)) for dx, dy in median),
+        leg_distance_px=distances,
+        n_pairs=min(s.n_pairs for s in structures),
+    )

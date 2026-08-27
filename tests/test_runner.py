@@ -282,6 +282,194 @@ def test_the_identity_warp_audit_recovers_a_known_camera_offset(
     assert summary.metrics["reg/mace"] == pytest.approx(float(np.hypot(*OFFSET_PX)), abs=0.1)
 
 
+def _pair_shape(manifest: Path) -> tuple[int, int]:
+    """The fixture's image shape, read rather than restated so the two cannot drift."""
+    from cmreg.imaging import read_gray
+
+    image = next(iter(sorted((manifest.parent / "val" / "optical" / "images").iterdir())))
+    return read_gray(image).shape
+
+
+def _offset_calibration(manifest: Path, path: Path, scale: float = 1.0) -> Path:
+    """The `offset_dataset` fixture's rig displacement, written as a calibration constant.
+
+    The fixture's docstring fixes the direction: optical `(x, y)` and thermal `(x - dx, y - dy)`
+    are the same scene point, so the map from thermal into optical -- the direction the cell
+    estimates -- is a translation by `(+dx, +dy)`. That translation displaces all four corners
+    equally, which is what a corner field of four identical shifts means.
+    """
+    from cmreg.gt import ResidualCalibration, write_calibration
+    from tests.conftest import OFFSET_PX
+
+    shape = _pair_shape(manifest)
+    dx, dy = (v * scale for v in OFFSET_PX)
+    return write_calibration(
+        ResidualCalibration(
+            dataset=manifest.parent.name,
+            height=shape[0],
+            width=shape[1],
+            corner_shift=((dx, dy),) * 4,
+            matchers=("fixture",),
+            spread_px=0.0,
+            worst_case_px=0.0,
+            n_pairs=4,
+            split="val",
+            git_sha="test",
+            note="the offset_dataset fixture's known rig displacement",
+        ),
+        path,
+    )
+
+
+def test_composing_a_known_calibration_removes_the_offset(
+    offset_dataset: Path, tmp_path: Path
+) -> None:
+    """**The direction pin for TASKS.md P2-12.** The mirror of the identity-warp audit above.
+
+    That test asserts an uncomposed cell *reports* the fixture's rig offset. This one asserts
+    that composing the very same offset as a calibration constant *removes* it: the truth
+    becomes `R . inv(H_gt)` and a matcher that recovers the pair exactly should now score near
+    zero rather than near `hypot(5, 3)`.
+
+    It is the pin because the arithmetic has a plausible wrong answer that no unit test of the
+    pieces would catch. Composing `R` in the opposite direction -- `inv(H_gt . R)` -- is equally
+    well-typed, runs without error, and *doubles* the misalignment instead of removing it. The
+    assertion on the wrong-direction magnitude below is what makes that failure loud.
+    """
+    from tests.conftest import OFFSET_PX
+
+    manifest = offset_dataset / "data.yaml"
+    calibration = _offset_calibration(manifest, tmp_path / "cal.json")
+
+    plain = run_benchmark(base_config(manifest, tmp_path / "plain", gt=IDENTITY_WARP))[0]
+    composed = run_benchmark(
+        base_config(
+            manifest,
+            tmp_path / "composed",
+            gt={**IDENTITY_WARP, "residual_calibration": str(calibration)},
+        )
+    )[0]
+
+    offset = float(np.hypot(*OFFSET_PX))
+    assert plain.metrics["reg/mace"] == pytest.approx(offset, abs=0.1)
+    assert composed.metrics["reg/mace"] < SUBPIXEL_PX
+    # And not merely smaller: composed the wrong way round the error would be ~2x the offset,
+    # which is on the far side of `plain` rather than below it.
+    assert composed.metrics["reg/mace"] < plain.metrics["reg/mace"]
+
+
+def test_composing_survives_a_real_warp(offset_dataset: Path, tmp_path: Path) -> None:
+    """The composition must hold under a non-trivial `H_gt`, not only under the identity.
+
+    Under the identity warp `truth` is just `R`, so an implementation that ignored `H_gt`
+    entirely would pass the test above. A full Tier-1 warp separates them: only
+    `R . inv(H_gt)`, in that order, scores near zero here.
+    """
+    manifest = offset_dataset / "data.yaml"
+    calibration = _offset_calibration(manifest, tmp_path / "cal.json")
+
+    plain = run_benchmark(base_config(manifest, tmp_path / "plain"))[0]
+    composed = run_benchmark(
+        base_config(
+            manifest,
+            tmp_path / "composed",
+            gt={"residual_calibration": str(calibration)},
+        )
+    )[0]
+    assert composed.metrics["reg/mace"] < plain.metrics["reg/mace"]
+    assert composed.metrics["reg/mace"] < SUBPIXEL_PX
+
+
+def test_a_zero_calibration_is_a_no_op(offset_dataset: Path, tmp_path: Path) -> None:
+    """Composing nothing must change nothing -- row for row, not merely on average.
+
+    Without this, a bug that quietly perturbed every composed run would be invisible: the
+    headline metric would still move in the right direction on the test above.
+    """
+    from cmreg.results import read_rows
+
+    manifest = offset_dataset / "data.yaml"
+    calibration = _offset_calibration(manifest, tmp_path / "cal.json", scale=0.0)
+
+    run_benchmark(base_config(manifest, tmp_path / "plain", gt=IDENTITY_WARP))
+    run_benchmark(
+        base_config(
+            manifest,
+            tmp_path / "zero",
+            gt={**IDENTITY_WARP, "residual_calibration": str(calibration)},
+        )
+    )
+    plain = {row.stem: row.corner_err for row in read_rows(tmp_path / "plain")}
+    zero = {row.stem: row.corner_err for row in read_rows(tmp_path / "zero")}
+    assert plain.keys() == zero.keys()
+    for stem, error in plain.items():
+        assert zero[stem] == pytest.approx(error, abs=1e-6)
+
+
+def test_the_row_records_which_constant_was_composed(offset_dataset: Path, tmp_path: Path) -> None:
+    """X-2: a pasted table has to be traceable to the exact matrix that produced it, and the
+    configured *path* cannot do that across two machines."""
+    from cmreg.gt import load_calibration
+    from cmreg.results import read_rows
+
+    manifest = offset_dataset / "data.yaml"
+    calibration = _offset_calibration(manifest, tmp_path / "cal.json")
+    run_benchmark(
+        base_config(
+            manifest,
+            tmp_path / "composed",
+            gt={**IDENTITY_WARP, "residual_calibration": str(calibration)},
+        )
+    )
+    digest = load_calibration(calibration).digest()
+    rows = read_rows(tmp_path / "composed")
+    assert {row.residual_calibration for row in rows} == {digest}
+
+    run_benchmark(base_config(manifest, tmp_path / "plain", gt=IDENTITY_WARP))
+    assert {row.residual_calibration for row in read_rows(tmp_path / "plain")} == {None}
+
+
+def test_a_calibration_for_another_dataset_is_refused(offset_dataset: Path, tmp_path: Path) -> None:
+    """A startup error, not a per-pair one: it is identical on all 300 pairs and should say so
+    once rather than write 300 rows blaming the data."""
+    manifest = offset_dataset / "data.yaml"
+    path = _offset_calibration(manifest, tmp_path / "cal.json")
+    wrong = json.loads(path.read_text())
+    wrong["dataset"] = "somewhere-else"
+    path.write_text(json.dumps(wrong))
+
+    with pytest.raises(RunnerError, match="somewhere-else"):
+        run_benchmark(
+            base_config(
+                manifest,
+                tmp_path / "run",
+                gt={**IDENTITY_WARP, "residual_calibration": str(path)},
+            )
+        )
+
+
+def test_a_calibration_on_a_monomodal_control_is_refused(
+    offset_dataset: Path, tmp_path: Path
+) -> None:
+    """The control's residual is zero by construction (P1-1b), so composing a constant there
+    would manufacture the very misalignment the control exists to exclude."""
+    manifest = offset_dataset / "data.yaml"
+    calibration = _offset_calibration(manifest, tmp_path / "cal.json")
+    with pytest.raises(RunnerError, match="mono-modal"):
+        run_benchmark(
+            base_config(
+                manifest,
+                tmp_path / "run",
+                gt={
+                    **IDENTITY_WARP,
+                    "reference": "optical",
+                    "moving": "optical",
+                    "residual_calibration": str(calibration),
+                },
+            )
+        )
+
+
 def test_the_monomodal_control_is_subpixel_where_the_cross_modal_cell_is_not(
     offset_dataset: Path, tmp_path: Path
 ) -> None:

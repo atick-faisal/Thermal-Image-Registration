@@ -372,3 +372,46 @@ def test_a_subsampled_run_reproduces_the_full_run_row_for_row(
     for row in sampled_rows:
         assert row.stem in reference
         assert row.corner_err == pytest.approx(reference[row.stem])
+
+
+def _register_raising_matcher(name: str) -> None:
+    """A matcher that raises on every pair, standing in for the many ways a backend can."""
+    from cmreg.matchers import register
+
+    class _Raises:
+        def __init__(self, config, device) -> None:
+            del config, device
+
+        @property
+        def name(self) -> str:
+            return name
+
+        def __call__(self, image0, image1):
+            del image0, image1
+            raise RuntimeError("backend exploded")
+
+    register(name, _Raises)
+
+
+def test_a_matcher_that_raises_costs_one_row_not_the_whole_run(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The P3-7 server crash cost 50 scored pairs x 20 matchers, because rows are written
+    only after the last pair. A backend blowing up is a property of that cell; X-4 says the
+    hard cases are rows, and the matchers sharing the run must still produce theirs."""
+    _register_raising_matcher("_raises")
+    run_dir = tmp_path / "raised"
+    config = base_config(
+        aligned_dataset / "data.yaml", run_dir, match={"matchers": ["sift", "_raises"]}
+    )
+    summaries = run_benchmark(config)
+
+    rows = read_rows(run_dir / FILENAME)
+    raised = [row for row in rows if row.matcher == "_raises"]
+    assert raised, "the failing matcher must still be represented"
+    assert all(row.failure_reason == "matcher_raised" for row in raised)
+    assert all(not row.success for row in raised)
+    # The shape is known here -- the pair decoded, the matcher is what failed.
+    assert all(row.height is not None and row.width is not None for row in raised)
+    sift = next(summary for summary in summaries if summary.context["matcher"] == "sift")
+    assert sift.metrics["reg/success_rate_5px"] > 0.0, "the healthy matcher kept its results"

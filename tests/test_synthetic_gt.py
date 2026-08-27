@@ -21,7 +21,7 @@ from cmreg.gt import (
     sample_homography,
     warp_seed,
 )
-from cmreg.warp import WarpError, apply_warp, corners, warp_points
+from cmreg.warp import WarpError, apply_warp, check_homography, corners, warp_points
 
 SHAPE = (48, 64)  # (height, width), non-square
 
@@ -114,3 +114,36 @@ def test_seed_and_index_do_not_collide() -> None:
 def test_singular_homography_is_rejected() -> None:
     with pytest.raises(WarpError, match="singular"):
         dense_displacement(np.zeros((3, 3)), SHAPE)
+
+
+def test_the_invertibility_check_is_symmetric_under_inversion() -> None:
+    """The P3-7 server crash, pinned.
+
+    The floor on ``|det|`` was one-sided, and ``det(inv(H)) == 1 / det(H)``: a grossly
+    expanding fit was accepted while its inverse -- which every symmetric error term needs --
+    was rejected, so ``symmetric_reprojection_error`` raised 50 pairs into a 300-pair run.
+    The guarantee is an equivalence, not blanket acceptance: whatever passes, its inverse
+    passes, and whatever is refused has its inverse refused too.
+    """
+
+    def accepts(matrix: np.ndarray) -> bool:
+        try:
+            check_homography(matrix)
+        except WarpError:
+            return False
+        return True
+
+    expanding = np.diag([1e5, 1e5, 1.0])
+    assert not accepts(expanding), "an expanding fit whose inverse is noise is unusable"
+    for matrix in (expanding, sample_homography(GTConfig(), generator(0, 0), SHAPE)):
+        assert accepts(matrix) == accepts(np.linalg.inv(matrix))
+
+
+def test_a_large_translation_is_not_mistaken_for_a_degenerate_one() -> None:
+    """The guard is on the determinant, not the condition number.
+
+    A translation of 1e7 px is absurd but exactly invertible, and its condition number is
+    ~1e14 -- the homography's entries mix pixel and dimensionless units, so conditioning
+    rejects legitimate transforms. ``det == 1`` says the right thing.
+    """
+    check_homography(np.array([[1.0, 0.0, 1e7], [0.0, 1.0, -1e7], [0.0, 0.0, 1.0]]))

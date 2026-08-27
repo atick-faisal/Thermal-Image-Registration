@@ -24,9 +24,12 @@ FloatArray = NDArray[np.float64]
 # object and string dtypes) and fails type-checking at every cv2 call site.
 ImageArray = NDArray[np.integer[Any] | np.floating[Any]]
 
-# Below this the homography is not usefully invertible and every derived quantity -- warped
-# corners, dense fields, reprojection errors -- is numerical noise.
+# Outside this determinant band the homography is not usefully invertible in *both*
+# directions, and every derived quantity -- warped corners, dense fields, reprojection
+# errors -- is numerical noise. The band is symmetric under inversion by construction:
+# `det(inv(H)) == 1 / det(H)`, so `[d, 1/d]` maps onto itself.
 _MIN_DETERMINANT = 1e-8
+_MAX_DETERMINANT = 1.0 / _MIN_DETERMINANT
 
 
 class WarpError(ValueError):
@@ -45,8 +48,18 @@ def check_homography(h: FloatArray) -> FloatArray:
         raise WarpError(f"homography must be 3x3, got {matrix.shape}")
     if not np.all(np.isfinite(matrix)):
         raise WarpError("homography contains non-finite entries")
-    if abs(float(np.linalg.det(matrix))) < _MIN_DETERMINANT:
-        raise WarpError(f"homography is singular (|det| < {_MIN_DETERMINANT})")
+    # Two-sided, because `check_homography` guards the inverse as much as the matrix: the
+    # symmetric error terms invert an already-checked `H`, and `det(inv(H)) == 1 / det(H)`.
+    # A one-sided floor accepted a grossly expanding fit whose inverse was pure noise, then
+    # raised from inside `symmetric_reprojection_error` -- crashing a 300-pair server run
+    # 50 pairs in. A *translation* of 1e7, by contrast, has `det == 1` and inverts exactly,
+    # which is why the test is the determinant and not the (unit-mixing) condition number.
+    determinant = abs(float(np.linalg.det(matrix)))
+    if not _MIN_DETERMINANT <= determinant <= _MAX_DETERMINANT:
+        raise WarpError(
+            f"homography is singular (|det| = {determinant:g}, outside "
+            f"[{_MIN_DETERMINANT}, {_MAX_DETERMINANT:g}])"
+        )
     return matrix
 
 

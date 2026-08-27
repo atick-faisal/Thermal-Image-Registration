@@ -54,7 +54,7 @@ import numpy as np
 from cmreg.config import Config, Modality
 from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
-from cmreg.estimate import Estimate, estimate_homography
+from cmreg.estimate import Estimate, EstimateError, estimate_homography
 from cmreg.gt import DenseGT, dense_displacement, generator, overlap_ratio, sample_homography
 from cmreg.imaging import ImagingError, read_gray
 from cmreg.matchers import MatchResult, get_matcher
@@ -153,7 +153,21 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
             )
             continue
         for name, matcher in matchers.items():
-            rows.append(_evaluate(pair, index, name, matcher, config, identity))
+            try:
+                rows.append(_evaluate(pair, index, name, matcher, config, identity))
+            except EstimateError:
+                # The one class of error that is about the *config*, not the pair -- PROSAC
+                # without confidences fails identically on all 300 pairs, so aborting says so
+                # once instead of writing 6000 rows that all blame the data.
+                raise
+            except Exception:
+                # A matcher raising is a property of that (pair, matcher), and the run's rows
+                # are only written after the last pair: letting it escape discards every pair
+                # already scored. X-4 says the hard cases are rows, and this is the hardest.
+                logger.exception(
+                    "%s on %s raised; recording the cell as a failure", name, pair.stem
+                )
+                rows.append(_failed_row(pair.stem, name, identity, "matcher_raised", pair.shape))
         if (position + 1) % 50 == 0:
             logger.info("  %d / %d pairs", position + 1, len(selected))
 
@@ -324,13 +338,19 @@ def _row(
     )
 
 
-def _failed_row(stem: str, matcher: str, identity: dict[str, object], reason: str) -> PairRow:
-    """A row for a pair that never reached the matcher."""
+def _failed_row(
+    stem: str,
+    matcher: str,
+    identity: dict[str, object],
+    reason: str,
+    shape: tuple[int, int] | None = None,
+) -> PairRow:
+    """A row for a cell that produced no estimate, because the pair or the matcher failed."""
     return PairRow(
         stem=stem,
-        # Null: this row exists because the pair could not be decoded, so there is no shape.
-        height=None,
-        width=None,
+        # Null when the pair could not be decoded, so there is no shape to report.
+        height=None if shape is None else shape[0],
+        width=None if shape is None else shape[1],
         matcher=matcher,
         success=False,
         failure_reason=reason,

@@ -87,6 +87,13 @@ class ResidualStructure:
     consensus: float
     # Mean ``corner_error(R_i, R_bar)``: the part that differs pair to pair.
     scatter: float
+    # Median ``corner_error(R_i, R_bar)``: the *typical* pair's departure from the consensus.
+    # The one scatter statistic that survives a matcher swap. Measured on FLIR val, roma scatters
+    # 6.56 px about its consensus and superpoint-lightglue 24.32 -- but splg's mean is 2.8x its
+    # own median, so those two numbers are not comparing the same thing and the difference is
+    # splg's failure tail, not a difference in the data. Comparing matchers is the entire point
+    # of P1-1d, and a mean cannot do it when one matcher fails gross and the other does not.
+    scatter_median: float
     # 1 - scatter/magnitude. 1 means wholly systematic, 0 means wholly random. Not a fraction
     # of variance -- these are pixel means, not squares -- so it is read as a ratio and nothing
     # more.
@@ -170,7 +177,10 @@ def residual_structure(rows: Sequence[PairRow]) -> ResidualStructure:
         [corner_error(m, identity, shape, saturate=True) for m in matrices], dtype=np.float64
     )
     magnitude = float(absolute.mean())
-    scatter = float(np.mean([corner_error(m, consensus, shape, saturate=True) for m in matrices]))
+    relative = np.array(
+        [corner_error(m, consensus, shape, saturate=True) for m in matrices], dtype=np.float64
+    )
+    scatter = float(relative.mean())
     reference = corners(shape)
     shift = warp_points(reference, consensus) - reference
     rotation_deg, scale, centre_shift = _decompose(consensus, shape)
@@ -184,6 +194,7 @@ def residual_structure(rows: Sequence[PairRow]) -> ResidualStructure:
         magnitude_median=float(np.median(absolute)),
         consensus=corner_error(consensus, identity, shape, saturate=True),
         scatter=scatter,
+        scatter_median=float(np.median(relative)),
         # Guarded rather than assumed positive: a run in which every pair registered perfectly
         # has magnitude 0, and the ratio is then 0/0 rather than a finding.
         systematic_fraction=float("nan") if magnitude == 0.0 else 1.0 - scatter / magnitude,
@@ -240,6 +251,9 @@ def render(structure: ResidualStructure) -> str:
     lines.append(f"{'  median px':<{_KEY_WIDTH}}{structure.magnitude_median:.4f}   (typical pair)")
     lines.append(f"{'  consensus px':<{_KEY_WIDTH}}{structure.consensus:.4f}   (systematic)")
     lines.append(f"{'  scatter px':<{_KEY_WIDTH}}{structure.scatter:.4f}   (random)")
+    lines.append(
+        f"{'  scatter median px':<{_KEY_WIDTH}}{structure.scatter_median:.4f}   (typical pair)"
+    )
     lines.append(f"{'systematic_fraction':<{_KEY_WIDTH}}{structure.systematic_fraction:.4f}")
     lines.append(rule)
     for name, (dx, dy) in zip(_CORNER_NAMES, structure.corner_shift, strict=True):

@@ -140,6 +140,21 @@ def test_a_heavy_tail_is_reported_as_such_rather_than_as_random() -> None:
     assert structure.consensus == pytest.approx(float(np.hypot(5.0, 3.0)))
     assert "tail-dominated" in render(structure)
 
+    # The point of `scatter_median`: the 36 well-behaved pairs sit *on* the consensus, so the
+    # typical pair's departure from it is zero even though the mean is dragged to ~157 px by
+    # the 14 gross fits. This is what makes a tail-poisoned run comparable with a clean one.
+    assert structure.scatter_median == pytest.approx(0.0, abs=1e-3)
+    assert structure.scatter > 100.0
+
+
+def test_the_scatter_median_tracks_the_mean_when_there_is_no_tail() -> None:
+    """The mirror of the above: absent gross fits the two scatter statistics must agree, or
+    swapping between them would itself change a P1-1d conclusion."""
+    rows = _rows([(5.0, 3.0), (5.0, -3.0), (-5.0, 3.0), (-5.0, -3.0)] * 5)
+    structure = residual_structure(rows)
+
+    assert structure.scatter_median == pytest.approx(structure.scatter, rel=0.05)
+
 
 def test_a_clean_dataset_reports_a_median_matching_its_mean() -> None:
     """The guard must not fire on the case it is not for: without a tail, mean == median and

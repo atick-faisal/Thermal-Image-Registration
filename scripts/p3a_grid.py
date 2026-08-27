@@ -103,8 +103,8 @@ CELLS = (
         "llvip",
         "driving",
         "public",
-        "night-time; where sparse detectors fail outright",
-        composes=True,
+        "night-time; where sparse detectors fail outright. Does NOT compose (P2-12)",
+        composes=False,
     ),
     Cell(
         "dronevehicle",

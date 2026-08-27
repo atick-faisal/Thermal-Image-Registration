@@ -68,32 +68,42 @@ SUBSAMPLE_SEED = 0
 class Dataset:
     name: str
     why: str
-    # False for `flir`, whose constant is already published from 1,013 pairs: this run
-    # re-derives it as an independent check and must not silently replace it.
-    publish: bool
+    # Where the constant lands, and it is never `calibration/<name>.json` for either dataset
+    # here -- that path is what `eval/runner.py` composes from, and neither of these should be
+    # picked up automatically. `flir` already has a better constant (1,013 pairs vs 300) and
+    # this run only checks it; `llvip` was measured and **rejected** (see `why`), so its file
+    # is evidence rather than an input.
+    out: Path
+    # Appended to the note stored in the file, so the JSON explains itself wherever it ends up.
+    caveat: str
 
     @property
     def manifest(self) -> Path:
         return Path("dataset/processed") / self.name / "data.yaml"
 
-    @property
-    def out(self) -> Path:
-        if self.publish:
-            return Path("calibration") / f"{self.name}.json"
-        return Path("runs") / "p3b_check" / f"{self.name}.json"
-
 
 DATASETS = (
     Dataset(
         "flir",
-        "CHECK: does 300 random pairs reproduce P1-1d's 1,013-pair constant?",
-        publish=False,
+        "CHECK: does 300 random pairs reproduce P1-1d's 1,013-pair constant? "
+        "ANSWERED 2026-08-27 -- yes, to 0.382 px mean corner distance.",
+        out=Path("runs") / "p3b_check" / "flir.json",
+        caveat=(
+            "CHECK RUN against the published 1,013-pair constant in calibration/flir.json; "
+            "not the published constant itself."
+        ),
     ),
     Dataset(
         "llvip",
-        "MEASURE: GRID.md §3 marks llvip 'compose', on 50 head-sliced pairs P1-1c flagged "
-        "as a provisional lower bound. This is the real measurement.",
-        publish=True,
+        "MEASURE: GRID.md §3 marked llvip 'compose' on 50 head-sliced pairs P1-1c flagged as "
+        "a provisional lower bound. ANSWERED 2026-08-27 -- it does NOT compose: the constant "
+        "is 2.21 px and the across-matcher worst case is 2.87 px, larger than the constant.",
+        out=Path("calibration") / "rejected" / "llvip.json",
+        caveat=(
+            "MEASURED AND REJECTED -- llvip does NOT compose; see TASKS.md P2-12. Kept as the "
+            "evidence for that decision, deliberately not at calibration/llvip.json where the "
+            "runner would find it."
+        ),
     ),
 )
 
@@ -167,28 +177,22 @@ def run(dataset: Dataset, device: str) -> None:
 
     note = (
         f"P2-12, {PAIRS} random val pairs (subsample_seed {SUBSAMPLE_SEED}), identity warp, "
-        f"element-wise median of {len(MATCHERS)} matchers' consensus corner fields."
+        f"element-wise median of {len(MATCHERS)} matchers' consensus corner fields. "
+        f"{dataset.caveat}"
     )
-    if not dataset.publish:
-        note += (
-            " CHECK RUN against the published 1,013-pair constant in calibration/flir.json; "
-            "not the published constant itself."
-        )
     print(f"########## {dataset.name} calibration ##########", flush=True)
     code = main(
         ["calibrate", *[str(d) for d in run_dirs], "--out", str(dataset.out), "--note", note]
     )
     if code != 0:
         raise SystemExit(f"{dataset.name} calibration failed with exit code {code}")
-    if not dataset.publish:
-        print(
-            f"########## {dataset.name}: COMPARE the block above with calibration/"
-            f"{dataset.name}.json ##########\n"
-            "  P1-1d's stated uncertainty is 1.23 px mean / 2.33 px worst case. A corner field\n"
-            "  further from the checked-in one than that is a finding to record in TASKS.md,\n"
-            "  not a file to overwrite.",
-            flush=True,
-        )
+    print(
+        f"########## {dataset.name}: {dataset.out} -- NOT composed automatically ##########\n"
+        "  Neither dataset here writes to calibration/<name>.json. Read the spread against the\n"
+        "  magnitude before composing anything: a constant whose across-matcher worst case\n"
+        "  approaches its own magnitude is not worth composing (P2-12, llvip).",
+        flush=True,
+    )
 
 
 def main_script(argv: list[str] | None = None) -> int:

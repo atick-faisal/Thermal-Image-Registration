@@ -53,7 +53,7 @@ under every Tier-1 number.
 |---|---|---|
 | `msrs` | **do not compose.** Report Tier-1 error as relative to the dataset's own alignment, thresholds above the floor | 13% systematic; composition would fit noise |
 | `flir` | **compose the three-matcher median corner field**, published with its ±1.23 px (2.33 px worst-case) across-matcher spread as a stated uncertainty — *and* report the floor anyway | reproduces across disjoint splits to 0.14%; removes ~9.5 px, injects ~1.2 px |
-| `llvip` | compose `R_bar`, and report the floor: 6.16 → 3.39 px still sits at the threshold | mixed; its scatter column is a provisional lower bound (50-pair, head-sliced) |
+| `llvip` | **do not compose** (revised 2026-08-27, P2-12). Report the floor | measured at 300 random pairs × 3 matchers: the constant is 2.21 px and the across-matcher worst case 2.87 px — *larger than the constant*. 0.3–4.7% systematic, below `msrs`'s 13% |
 | `dronevehicle` | **do not compose, and treat Tier-1 as invalid on the 28% of pairs that fail catastrophically** whatever the threshold. The aerial domain needs Tier-2 (P2-10) or Tier-3 (P2-8) | 1% systematic; 4.73 px median under a 77.97 px mean |
 
 **Never compose a per-pair `R_i`** (P1-1b): it comes from a matcher, so folding it into the GT
@@ -76,8 +76,14 @@ seconds. `scripts/p3b_calibrate.py` is the server driver.
 
 | | status |
 |---|---|
-| `calibration/flir.json` | **published** — P1-1d's 1,013-pair three-matcher median, ±1.23 px mean / 2.33 px worst case |
-| `calibration/llvip.json` | **pending** — GRID.md marked `llvip` "compose" on 50 head-sliced pairs that P1-1c flagged as a provisional lower bound. `p3b_calibrate.py` measures it properly at 300 random pairs × 3 matchers before stage A re-runs |
+| `calibration/flir.json` | **published and independently checked.** P1-1d's 1,013-pair three-matcher median; a disjoint 300-pair random sample reproduces it to **0.382 px** mean corner distance, well inside its stated ±1.23 px |
+| `calibration/rejected/llvip.json` | **measured and rejected.** Kept as the evidence, deliberately not at the path the runner reads |
+
+**The test a constant has to pass, stated once so no future dataset re-argues it:** the
+across-matcher spread must be small *against the constant's own magnitude*, not merely small in
+absolute terms. Both constants have a ~1.2 px spread; on `flir` that is 13% of a 9.46 px
+constant and on `llvip` 57% of a 2.21 px one, with a worst case of 130%. Composing `llvip`
+would remove 2.2 px and inject up to 2.9 px.
 
 `scripts/p3a_grid.py` carries the policy per cell and **fails** a composing cell whose constant
 is absent rather than running it uncomposed: the two produce tables that look identical, and

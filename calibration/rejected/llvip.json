@@ -1,0 +1,36 @@
+{
+  "dataset": "llvip",
+  "height": 1024,
+  "width": 1280,
+  "corner_shift": [
+    [
+      -0.8628000020980835,
+      -1.0779880285263062
+    ],
+    [
+      -0.6025390624997726,
+      1.0100518463669357
+    ],
+    [
+      -2.469604632341998,
+      -2.212280413591998
+    ],
+    [
+      2.4815886020660405,
+      1.5997314453125
+    ]
+  ],
+  "matchers": [
+    "roma",
+    "superpoint-lightglue",
+    "eloftr"
+  ],
+  "spread_px": 1.2581294290218512,
+  "worst_case_px": 2.870239143101806,
+  "n_pairs": 300,
+  "split": "val",
+  "git_sha": "555ab99",
+  "note": "MEASURED AND REJECTED -- llvip does NOT compose. TASKS.md P2-12, 300 random val pairs, identity warp, three-matcher median. The constant is 2.21 px while the across-matcher spread is 1.26 px mean and 2.87 px worst case, so composing it would remove 2.2 px of systematic misalignment and inject up to 2.9 px of matcher-choice bias -- larger than the constant itself. Systematic fraction is 0.003-0.047 across the three legs, below msrs's 0.13, and msrs already does not compose. Kept as the evidence for that decision (X-4), deliberately not at calibration/llvip.json where the runner would find it.",
+  "digest": "49b9dfb74c2dd477",
+  "magnitude_px": 2.2062478607684017
+}

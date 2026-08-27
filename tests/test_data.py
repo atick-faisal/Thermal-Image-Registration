@@ -16,6 +16,7 @@ from cmreg.data import (
     SplitDriftError,
     freeze_split,
     load_split_manifest,
+    select_pairs,
     verify_split,
     write_split_manifest,
 )
@@ -112,3 +113,60 @@ def test_split_drift_is_loud(manifest_path: Path, tmp_path: Path) -> None:
 
     with pytest.raises(SplitDriftError, match=r"val: \+0 -1"):
         verify_split(record, DatasetManifest.load(root / "data.yaml"))
+
+
+# --- subsample selection (TASKS.md P3-1) ------------------------------------------------
+#
+# `select_pairs` exists because P1-1c measured what the head slice costs: 50 consecutive
+# frames of a driving set are one scene, so the systematic term came back right (x0.98) and
+# the random one 3.6x too low. The tests below pin the three properties that finding needs --
+# it is a real sample, it is reproducible, and it carries each pair's *split* index so a
+# subsample and the full run it samples from agree about which warp pair i receives.
+
+_IMAGES = tuple(Path(f"images/{i:03d}.png") for i in range(20))
+
+
+def test_no_limit_selects_the_whole_split() -> None:
+    assert select_pairs(_IMAGES, 0) == tuple(enumerate(_IMAGES))
+    assert select_pairs(_IMAGES, len(_IMAGES) + 5, subsample_seed=1) == tuple(enumerate(_IMAGES))
+
+
+def test_without_a_seed_the_selection_is_the_head_slice() -> None:
+    """The pre-P1-1c behaviour, kept as the default so old configs still mean what they meant."""
+    assert select_pairs(_IMAGES, 4) == tuple(enumerate(_IMAGES[:4]))
+
+
+def test_a_seeded_subsample_is_not_the_head_slice() -> None:
+    """The P1-1c regression itself. A sample that happened to return the first N pairs would
+    reproduce the one-scene artefact while looking like a fix."""
+    selected = select_pairs(_IMAGES, 5, subsample_seed=0)
+    assert [path for _, path in selected] != list(_IMAGES[:5])
+
+
+def test_a_seeded_subsample_is_reproducible_and_seed_dependent() -> None:
+    assert select_pairs(_IMAGES, 6, subsample_seed=0) == select_pairs(_IMAGES, 6, subsample_seed=0)
+    assert select_pairs(_IMAGES, 6, subsample_seed=0) != select_pairs(_IMAGES, 6, subsample_seed=1)
+
+
+def test_a_subsample_is_a_distinct_ordered_subset_carrying_split_indices() -> None:
+    selected = select_pairs(_IMAGES, 7, subsample_seed=3)
+    indices = [index for index, _ in selected]
+    assert len(selected) == 7
+    assert len(set(indices)) == 7, "drawn without replacement"
+    assert indices == sorted(indices), "split order is restored after sampling"
+    # The index is the pair's position in the *split*, not in the subsample: it seeds the
+    # synthetic warp (`gt/synthetic.py::warp_seed`), so re-numbering 0..N-1 would give the same
+    # image a different warp here than in the full-split run.
+    assert all(_IMAGES[index] == path for index, path in selected)
+
+
+def test_the_subsample_does_not_consume_the_ambient_rng() -> None:
+    """`seeding.py::seed_cell` reseeds `random` and numpy's global state per evaluation cell,
+    so a selection drawn from either would depend on whatever ran before it in the process."""
+    import random
+
+    random.seed(1234)
+    before = random.random()
+    random.seed(1234)
+    select_pairs(_IMAGES, 5, subsample_seed=7)
+    assert random.random() == before

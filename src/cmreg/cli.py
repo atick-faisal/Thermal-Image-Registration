@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cmreg import __version__
-from cmreg.config.schema import Estimator, Modality, Variant
+from cmreg.config.schema import Domain, Estimator, Modality, Platform, Variant
 
 logger = logging.getLogger("cmreg")
 
@@ -33,6 +33,8 @@ DATASET_ROOT = Path(
 
 _VARIANTS = [v.value for v in Variant]
 _MODALITIES = [m.value for m in Modality]
+_DOMAINS = [d.value for d in Domain]
+_PLATFORMS = [p.value for p in Platform]
 
 # flag name -> dotted path into the config. See convention 2 above.
 _OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -43,6 +45,7 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "data": ("data", "manifest"),
     "split": ("data", "split"),
     "limit": ("data", "limit"),
+    "subsample_seed": ("data", "subsample_seed"),
     "seed": ("gt", "seed"),
     "moving": ("gt", "moving"),
     "reference": ("gt", "reference"),
@@ -52,6 +55,8 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "preprocess_ref": ("preprocess", "reference"),
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
+    "domain": ("eval", "domain"),
+    "platform": ("eval", "platform"),
 }
 
 
@@ -79,9 +84,20 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name")
     parser.add_argument("--run-dir", dest="run_dir", type=Path)
     parser.add_argument("--wandb", action="store_true", default=None)
+    # The off switch a campaign config needs: `p3a_baseline_grid.yaml` sets `wandb: true`
+    # because X-1 forbids local-only results on the server, and smoke-running that same
+    # file on a machine with no `wandb login` would otherwise die after the Parquet is
+    # written but before the summary is rendered.
+    parser.add_argument("--no-wandb", dest="wandb", action="store_false", default=None)
     parser.add_argument("--data", type=Path, help="path to the dataset's data.yaml")
     parser.add_argument("--split", choices=("train", "val"))
     parser.add_argument("--limit", type=int, help="cap the number of pairs (0 = all)")
+    parser.add_argument(
+        "--subsample-seed",
+        dest="subsample_seed",
+        type=int,
+        help="draw --limit pairs at random under this seed instead of taking the head",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--moving", choices=_MODALITIES, help="which modality receives the synthetic warp"
@@ -102,6 +118,11 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
     parser.add_argument("--preprocess-mov", dest="preprocess_mov", choices=_VARIANTS)
     parser.add_argument("--upsample", type=int, help="thermal upsampling factor (1-8)")
+    # Labels, not knobs -- but a campaign that points one config at four datasets has to
+    # relabel them per cell, and a `dronevehicle` row filed as `driving/public` is pooled
+    # into the easy domain and silently hides the hard case (`scripts/p3a_grid.py`).
+    parser.add_argument("--domain", choices=_DOMAINS)
+    parser.add_argument("--platform", choices=_PLATFORMS)
 
 
 def _comma_separated(value: str) -> tuple[str, ...]:
@@ -139,8 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--thresholds",
         type=float,
         nargs="+",
-        default=(3.0, 5.0, 10.0),
-        help="corner-error thresholds in pixels for AUC and success rate",
+        default=(3.0, 5.0, 10.0, 20.0),
+        help="corner-error thresholds in pixels for AUC and success rate "
+        "(EvalConfig.thresholds_px's default ladder; see experiments/GRID.md)",
     )
     report.set_defaults(handler=_run_report)
 
@@ -182,23 +204,24 @@ def _run_gt(args: argparse.Namespace) -> int:
     import json
 
     from cmreg.config import Config
-    from cmreg.data import DatasetManifest
+    from cmreg.data import DatasetManifest, select_pairs
     from cmreg.gt import dense_displacement, generator, overlap_ratio, sample_homography
     from cmreg.imaging import read_shape
 
     config = Config.load(args.config, overrides_from_args(args))
     manifest = DatasetManifest.load(config.data.manifest)
     images = manifest.images(config.data.split)
-    if config.data.limit:
-        images = images[: config.data.limit]
     if not images:
         logger.error("no images in the '%s' split of %s", config.data.split, manifest.path)
         return 1
 
-    manifest.pairing.validate_pairs(images)
+    # The same selection `eval/runner.py` makes, so a GT file and the bench run that consumes
+    # it cover the same pairs under the same warps -- by construction, not by coincidence.
+    selected = select_pairs(images, config.data.limit, config.data.subsample_seed)
+    manifest.pairing.validate_pairs([path for _, path in selected])
 
     records = []
-    for index, image in enumerate(images):
+    for index, image in selected:
         shape = read_shape(image)
         homography = sample_homography(config.gt, generator(config.gt.seed, index), shape)
         records.append(

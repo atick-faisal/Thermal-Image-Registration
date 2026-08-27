@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from cmreg.data.manifest import IMAGE_SUFFIXES, DatasetManifest
 
@@ -133,3 +136,32 @@ def _drift_message(record: SplitManifest, current: SplitManifest) -> str:
 
 def _preview(stems: list[str]) -> str:
     return f"{', '.join(stems[:_PREVIEW])}{'...' if len(stems) > _PREVIEW else ''}"
+
+
+def select_pairs(
+    images: Sequence[Path], limit: int, subsample_seed: int | None = None
+) -> tuple[tuple[int, Path], ...]:
+    """Choose which pairs of a split a run scores, keeping each one's **split index**.
+
+    The index travels with the path because ``gt/synthetic.py::warp_seed`` keys a pair's
+    synthetic warp on ``(seed, index)`` so that "pair *i* gets the same warp however the work
+    was scheduled". Re-numbering a subsample 0..N-1 would break exactly that: the same image
+    would receive one warp in a 300-pair run and another in the full-split run it is supposed
+    to be a sample of, and the two would not be comparable. Head slicing hid the question --
+    ``images[:N]`` happens to preserve indices -- and a random subsample does not.
+
+    ``subsample_seed`` of ``None`` is that head slice, kept as the default so every config
+    written before TASKS.md P1-1c still means what it meant. An int draws ``limit`` pairs
+    uniformly without replacement, then restores sorted order so the run's log and its Parquet
+    rows read in the same order the split does.
+
+    Drawn with ``numpy.random.default_rng`` rather than ``random.sample``: the ambient
+    ``random`` module is reseeded per evaluation cell by ``seeding.py::seed_cell``, so a
+    selection taken from it would depend on whatever ran before it in the same process.
+    """
+    if limit <= 0 or limit >= len(images):
+        return tuple(enumerate(images))
+    if subsample_seed is None:
+        return tuple(enumerate(images[:limit]))
+    chosen = np.random.default_rng(subsample_seed).choice(len(images), size=limit, replace=False)
+    return tuple((int(index), images[int(index)]) for index in sorted(chosen))

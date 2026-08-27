@@ -9,6 +9,7 @@ from cmreg.data.splits import (
     SplitManifest,
     freeze_split,
     load_split_manifest,
+    select_pairs,
     verify_split,
     write_split_manifest,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "SplitManifest",
     "freeze_split",
     "load_split_manifest",
+    "select_pairs",
     "verify_split",
     "write_split_manifest",
 ]

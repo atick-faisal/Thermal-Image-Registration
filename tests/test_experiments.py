@@ -33,3 +33,18 @@ def test_smoke_config_is_actually_a_smoke_config() -> None:
     assert config.runtime.device == "cpu"
     assert 0 < config.data.limit <= 16
     assert not config.runtime.wandb
+
+
+def test_stage_a_draws_its_pairs_at_random() -> None:
+    """P1-1c's regression, pinned in the config rather than only in the code.
+
+    Stage A's every conclusion is a spread across pairs, and a head slice of a driving set is
+    one scene -- it measured the random term 3.6x too low. A `limit` left without a
+    `subsample_seed` here would run for hours and produce that artefact silently.
+    """
+    config = Config.load(
+        Path(__file__).resolve().parents[1] / "experiments" / "p3a_baseline_grid.yaml"
+    )
+    assert config.data.limit > 0
+    assert config.data.subsample_seed is not None
+    assert config.eval.thresholds_px == (3.0, 5.0, 10.0, 20.0)

@@ -52,7 +52,7 @@ from pathlib import Path
 import numpy as np
 
 from cmreg.config import Config, Modality
-from cmreg.data import DatasetManifest
+from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
 from cmreg.estimate import Estimate, estimate_homography
 from cmreg.gt import DenseGT, dense_displacement, generator, overlap_ratio, sample_homography
@@ -71,13 +71,19 @@ logger = logging.getLogger(__name__)
 # TPS and residual-flow entries slot in without a schema migration.
 WARP_MODEL = "homography"
 
-# Metrics shown in the multi-matcher comparison table. The headline three plus the tightest
-# threshold: enough to rank methods at a glance, short enough to stay one line per matcher.
+# Metrics shown in the multi-matcher comparison table. The headline three plus one threshold:
+# enough to rank methods at a glance, short enough to stay one line per matcher.
+#
+# That threshold is **5 px, not the tightest one**. TASKS.md P1-1d measured that no dataset in
+# the benchmark supports a 3 px Tier-1 threshold on its native alignment -- the typical FLIR
+# pair retains 4-5 px after every reproducible rig error is removed -- so a 3 px column reads
+# 0.0000 for every matcher and ranks nothing. `experiments/GRID.md` §2 reports the full
+# 3/5/10/20 ladder; this is the one column that has to earn its width.
 COMPARISON_KEYS = (
     "reg/mace",
     "reg/epe_mean",
-    "reg/auc_3px",
-    "reg/success_rate_3px",
+    "reg/auc_5px",
+    "reg/success_rate_5px",
     "reg/failure_rate",
     "match/inliers",
     "time/total_ms",
@@ -107,11 +113,12 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
     """Run every configured matcher over a split and return one summary each."""
     manifest = DatasetManifest.load(config.data.manifest)
     images = manifest.images(config.data.split)
-    if config.data.limit:
-        images = images[: config.data.limit]
     if not images:
         raise RunnerError(f"no images in the '{config.data.split}' split of {manifest.path}")
-    manifest.pairing.validate_pairs(images)
+    # `(split index, path)`, because the index keys the pair's synthetic warp and must not
+    # depend on how the split was sampled (`data/splits.py::select_pairs`).
+    selected = select_pairs(images, config.data.limit, config.data.subsample_seed)
+    manifest.pairing.validate_pairs([path for _, path in selected])
 
     # Resolved once, and logged: PLAN.md §15B records RoMa on Windows leaving DINOv2 on the CPU
     # even with CUDA available, so a run that quietly landed on the wrong device has to be
@@ -121,7 +128,7 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
     logger.info(
         "benchmarking %s over %d pairs of %s [%s] on %s",
         ", ".join(matchers),
-        len(images),
+        len(selected),
         manifest.path.parent.name,
         config.data.split,
         device,
@@ -137,7 +144,7 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
 
     rows: list[PairRow] = []
     identity = _identity_columns(config, manifest)
-    for index, optical_path in enumerate(images):
+    for position, (index, optical_path) in enumerate(selected):
         pair = _load_pair(optical_path, manifest, config, index)
         if pair is None:
             rows.extend(
@@ -147,8 +154,8 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
             continue
         for name, matcher in matchers.items():
             rows.append(_evaluate(pair, index, name, matcher, config, identity))
-        if (index + 1) % 50 == 0:
-            logger.info("  %d / %d pairs", index + 1, len(images))
+        if (position + 1) % 50 == 0:
+            logger.info("  %d / %d pairs", position + 1, len(selected))
 
     run_dir = Path(config.runtime.path)
     config.snapshot(run_dir)

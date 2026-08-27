@@ -72,7 +72,10 @@ def manifest_path(dataset_root: Path) -> Path:
 # visible as a large error rather than as a failed match.
 
 TEXTURED_SIZE = (240, 320)  # (height, width)
-N_TEXTURED = 4
+# Six, not four: `train` takes the first two, leaving a four-pair `val` split. Anything
+# smaller cannot express a *random* subsample of a split -- a two-pair val with limit 2 is
+# the whole split however it was drawn, and the P3-1 selection test would pass vacuously.
+N_TEXTURED = 6
 TEXTURED_STEMS = [f"{(3 * i) % 7:02d}_tex_{i:03d}" for i in range(N_TEXTURED)]
 
 

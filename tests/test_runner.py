@@ -341,3 +341,34 @@ def test_rows_carry_the_shape_and_the_estimated_homography(
             np.asarray(row.h).reshape(3, 3), np.eye(3), (row.height, row.width)
         )
         assert row.corner_err == pytest.approx(recovered, abs=1e-6)
+
+
+def test_a_subsampled_run_reproduces_the_full_run_row_for_row(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """A subsample must be a *sample* of the full run, not a different experiment.
+
+    The whole risk of TASKS.md P3-1's random-subsample path is here: the pair's index seeds its
+    synthetic warp, so re-numbering the drawn pairs 0..N-1 would hand the same image a
+    different warp than the full-split run it is supposed to sample from, and the 300-pair
+    Stage-A cell would not be comparable with anything. Scoring identical `corner_err` per stem
+    across the two runs is the only check that catches that.
+    """
+    full = base_config(aligned_dataset / "data.yaml", tmp_path / "full")
+    run_benchmark(full)
+    sampled = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "sampled",
+        data={"limit": 2, "subsample_seed": 0},
+    )
+    (summary,) = run_benchmark(sampled)
+    assert summary.n_pairs == 2
+
+    rows = read_rows(tmp_path / "full")
+    reference = {row.stem: row.corner_err for row in rows}
+    sampled_rows = read_rows(tmp_path / "sampled")
+    head = [row.stem for row in rows][:2]
+    assert [row.stem for row in sampled_rows] != head, "a head slice would pass this vacuously"
+    for row in sampled_rows:
+        assert row.stem in reference
+        assert row.corner_err == pytest.approx(reference[row.stem])

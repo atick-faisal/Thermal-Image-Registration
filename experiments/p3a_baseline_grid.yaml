@@ -1,0 +1,101 @@
+# P3-7 / Stage A: the matcher x dataset baseline grid -- the master table of PLAN.md Figure 5.
+#
+# This file *is* the anchor cell of `experiments/GRID.md`: every later stage is authored as a
+# diff against it, so a change here silently redefines the whole of Phase 3. Read §1 there
+# before editing any field.
+#
+# One cell per dataset, driven by `scripts/p3a_grid.py`, which overrides only the manifest,
+# the run directory, and the domain/platform labels. Run it rather than this file directly --
+# the driver is what keeps the four cells' non-scientific fields in agreement.
+#
+# The absolute numbers this produces are floors, not accuracies: no `R` composition is applied
+# (GRID.md §3), so each dataset's own residual misalignment sits under every row of its cell.
+# That is legitimate here because a stage-A row compares matchers *within* one dataset, where
+# `R` is common to all of them -- and illegitimate the moment a number is quoted across
+# datasets without the residual beside it.
+runtime:
+  device: cuda
+  name: p3a_baseline
+  path: runs/p3a_baseline
+  # X-1: no local-only results. Needs `wandb login` and the four TASKS.md §0 projects to exist.
+  wandb: true
+  wandb_project: cmreg-bench
+  group: p3a_baseline
+
+data:
+  manifest: dataset/processed/msrs/data.yaml
+  split: val
+  # 300 pairs per dataset, drawn at random rather than head-sliced. P1-1c: 50 consecutive
+  # frames of a driving set are one scene, and a contiguous sample estimates a systematic term
+  # correctly and a random one 3.6x too low. Every conclusion in this stage is a spread across
+  # pairs, so the head slice is not an option here.
+  limit: 300
+  subsample_seed: 0
+
+# The full Tier-1 range (PLAN.md §5). P3-7 once suspected this of causing `auc_3px = 0`;
+# P1-1a measured the same zero with *no* warp at all, so the range was never the constraint.
+gt:
+  seed: 0
+  moving: thermal
+  rotation_deg: 30.0
+  scale_min: 0.8
+  scale_max: 1.25
+  perspective: 0.05
+  translation: 0.05
+
+preprocess:
+  reference: invert
+  moving: percentile
+  percentile_low: 2.0
+  percentile_high: 98.0
+  clahe_clip: 2.0
+  clahe_tile: 8
+  moving_upsample: 1
+  moving_interpolation: bicubic
+
+match:
+  # Every registered backend (`cmreg matchers`). The master table is the one place a gap is a
+  # reviewer question rather than a scoping decision; the reduced-8 subset starts at stage C.
+  # `sift`/`orb` are this repo's OpenCV classical arm and `sift-nn`/`orb-nn` are vismatch's --
+  # kept apart deliberately, since the two implementations are not the same measurement.
+  matchers:
+    - roma
+    - romav2
+    - minima-roma
+    - matchanything-roma
+    - matchanything-eloftr
+    - gim-dkm
+    - loftr
+    - eloftr
+    - xoftr
+    - minima-loftr
+    - minima-xoftr
+    - tiny-roma
+    - superpoint-lightglue
+    - disk-lightglue
+    - aliked-lightglue
+    - xfeat
+    - sift-nn
+    - orb-nn
+    - sift
+    - orb
+  # Not honoured by the detector-free entries: `minima-roma` returns 10 000 matches under any
+  # budget and `matchanything` has none at all (P0-2). Which matches to drop is P3-12's
+  # question; capping here would bury it.
+  max_keypoints: 4096
+  ratio_test: 0.8
+
+estimate:
+  method: magsac
+  # The estimator's *inlier* threshold, unrelated to the reporting ladder below.
+  threshold_px: 3.0
+  max_iters: 10000
+  confidence: 0.9999
+
+eval:
+  # 3 px is kept for continuity with P1-1a/b/c and is unreachable on every dataset here by
+  # construction; read this ladder from 5 px up (GRID.md §2).
+  thresholds_px: [3.0, 5.0, 10.0, 20.0]
+  # Overridden per cell by the driver -- dronevehicle is aerial/drone, the rest driving/public.
+  domain: driving
+  platform: public

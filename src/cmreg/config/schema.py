@@ -130,6 +130,13 @@ class DataConfig(ConfigBase):
     # Cap on pairs, for smoke runs. 0 means all; a nonzero value left in a real config
     # silently reports a subset as if it were the whole benchmark.
     limit: int = 0
+    # How those `limit` pairs are chosen. `None` takes the head of the sorted split, which is
+    # what every run before TASKS.md P1-1c did and is the cheaper thing to reproduce; an int
+    # draws them uniformly at random under that seed. The failure mode is measured, not
+    # hypothetical: consecutive frames of a driving set are one scene, so the head slice
+    # estimates a systematic term correctly (x0.98 on flir val) and a random one not at all
+    # (x3.57). Any run whose conclusion depends on the spread across pairs must set this.
+    subsample_seed: int | None = None
 
     @field_validator("split")
     @classmethod
@@ -215,8 +222,13 @@ class EvalConfig(ConfigBase):
     """How results are scored and reported."""
 
     # Corner-error thresholds in pixels for AUC and success rate. Frozen alongside the
-    # metrics schema: changing them makes every prior number incomparable (X-5).
-    thresholds_px: tuple[float, ...] = (3.0, 5.0, 10.0)
+    # metrics schema: *removing* one makes every prior number incomparable (X-5), which is why
+    # 3 px stays even though TASKS.md P1-1d showed no dataset in the benchmark can reach it on
+    # its native alignment. 20 px was added there instead: `metrics/schema.py::auc_key` derives
+    # a key per threshold, so an addition costs one dict entry and needs no migration. Read the
+    # ladder from 5 px up (`experiments/GRID.md`); a headline quoted at 3 px is reporting the
+    # dataset's own residual misalignment, not the matcher.
+    thresholds_px: tuple[float, ...] = (3.0, 5.0, 10.0, 20.0)
     # Which domain family these pairs belong to. Reported per-domain, never pooled.
     domain: Domain = Domain.DRIVING
     # Which capture platform. A wrong value here silently mislabels a per-platform row.

@@ -28,14 +28,24 @@ from cmreg.config import Config
 logger = logging.getLogger(__name__)
 
 _DIRTY_SUFFIX = "-dirty"
+_UNTRACKED_SUFFIX = "-untracked"
 
 
 def git_sha() -> str:
-    """The current commit, with ``-dirty`` appended when the tree has uncommitted changes.
+    """The current commit, suffixed with what the working tree adds to it.
 
     TASKS.md X-2 requires every claim to be traceable to a run and an artifact version; a
     result produced from an uncommitted tree is traceable to nothing, so the flag is part of
     the identifier rather than a separate field that can be dropped.
+
+    **Two suffixes, not one.** ``-dirty`` meant "anything at all in `git status`", which
+    included untracked files, and P3-7's stage-A runs 2 and 3 both carried it for two
+    untracked artefacts the run never read (a log file and a stray calibration constant) --
+    costing two rounds of asking the server what had changed, for an answer of "nothing".
+    Untracked files are still reported, because an untracked ``.py`` can absolutely change a
+    result, but as ``-untracked``: it says the code that ran is the commit plus something the
+    puller does not have, where ``-dirty`` says the commit itself is not what ran. Both are
+    still a warning; only one of them means a re-pull cannot reproduce the tracked code.
     """
     try:
         sha = subprocess.run(
@@ -45,8 +55,15 @@ def git_sha() -> str:
             check=True,
             timeout=10,
         ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
+        tracked = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
             capture_output=True,
             text=True,
             check=True,
@@ -54,7 +71,9 @@ def git_sha() -> str:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-    return f"{sha}{_DIRTY_SUFFIX}" if dirty else sha
+    if tracked:
+        return f"{sha}{_DIRTY_SUFFIX}"
+    return f"{sha}{_UNTRACKED_SUFFIX}" if untracked else sha
 
 
 def run_name(phase: str, method: str, dataset: str, variant: str, seed: int) -> str:

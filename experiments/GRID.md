@@ -40,6 +40,11 @@ stage is authored as a diff against it.
   floor (P1-1b sweep B). **No dataset in the benchmark supports a 3 px Tier-1 threshold on its
   native alignment.** A 3 px column is therefore reporting the dataset's residual
   misalignment, not the matcher, and is kept only for continuity with P1-1a/b/c.
+- **Amended by stage A run 3 (2026-08-28), on the one composed column only.** The claim above
+  holds for a dataset *on its native alignment*; once `flir`'s constant is composed the 3 px
+  column reads 0.17–0.23 across the top twelve rather than 0.00, and it does discriminate. It
+  is still not the headline — the ranking it produces there agrees with the 5 px column, so it
+  adds no information and it exists on exactly one of four datasets.
 - 20 px exists because `dronevehicle`'s useful signal lives above 10 px (28% of its pairs are
   gross failures at *any* threshold, and the rest are ~4.7 px median).
 
@@ -78,6 +83,12 @@ seconds. `scripts/p3b_calibrate.py` is the server driver.
 |---|---|
 | `calibration/flir.json` | **published and independently checked.** P1-1d's 1,013-pair three-matcher median; a disjoint 300-pair random sample reproduces it to **0.382 px** mean corner distance, well inside its stated ±1.23 px |
 | `calibration/rejected/llvip.json` | **measured and rejected.** Kept as the evidence, deliberately not at the path the runner reads |
+
+**Measured effect, stage A run 3** (300 random val pairs × 20 matchers): composing `flir` drops
+`reg/mace` on every matcher (best 13.13 → 7.21), pulls `epe_median` from a 4.5–5.8 px band to
+1.96–2.98 px, and takes `success_rate_5px` from ten exact zeros to 0.36–0.54. It does *not* go
+to zero — the ~4 px across-pair scatter survives, which is the systematic/random split behaving
+as P1-1d described it.
 
 **The test a constant has to pass, stated once so no future dataset re-argues it:** the
 across-matcher spread must be small *against the constant's own magnitude*, not merely small in

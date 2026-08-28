@@ -154,18 +154,27 @@ P2-3's degradations) and are listed to fix their shape, not to be launched.
 
 ## 7. Cost
 
-Summing the P0-2 per-matcher macOS-CPU timings gives **144.6 s/pair** for all 20 matchers.
-At an assumed 30-50x A100 speedup that is 2.9-4.8 s/pair, so:
+**Rewritten from stage A's own `time/total_ms`** (runs 1 and 2, 2026-08-27), as the previous
+version of this section said it should be. The projection it replaces summed the P0-2 macOS-CPU
+timings to 144.6 s/pair for all 20 matchers and assumed a 30-50x A100 speedup; the speedup is
+**20-29x**, so every row below is ~1.45x its predecessor.
 
-| stage | pairs scored | estimate |
+| dataset | resolution | s/pair, 20 matchers | 300 pairs |
+|---|---|---|---|
+| `flir` | 640x512 | 5.0 | 25 min |
+| `msrs` | 640x480 | 5.1 | 25 min |
+| `dronevehicle` | 640x512 | 5.2 | 26 min |
+| `llvip` | **1280x1024** | **7.3** | 37 min |
+
+| stage | pairs scored | cost |
 |---|---|---|
-| A | 1,200 | **1.0-1.6 h** |
-| B | 4,800 | 4-7 h |
-| C-D | reduced-8, ~16,800 | roughly a day each |
+| A | 1,200 | **~1.9 h**, measured |
+| B | 4,800 | ~7.5 h, scaled from A at 5.65 s/pair |
+| C-D | reduced-8, ~16,800 | still roughly a day each; the reduced-8 subset's own rate is not measured yet |
 
-The estimate is a projection from CPU timings, not a measurement; **stage A's own
-`time/total_ms` column replaces it**, and this table should be rewritten from that number
-rather than left as a guess.
+Resolution is the only variable that moves the per-pair cost materially -- three 640-wide sets
+sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget
+should be read off its resolution, not off the mean.
 
 ## 8. What this grid does not cover
 

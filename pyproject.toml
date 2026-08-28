@@ -132,7 +132,10 @@ extend-exclude = ["*.md"]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
+# `scripts/` is not a package and has no entry point; both it and the repo root have to be
+# on the path for `tests/test_grid_driver.py` to import a driver the way pytest does.
+extraPaths = ["scripts"]
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "standard"
@@ -141,9 +144,10 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # The repo root on sys.path, so tests can `import tests.conftest` for the fixture's stem
-# lists, and so a future `scripts/` (which has no console-script entry point, unlike the
-# installed `cmreg` package) is importable from a test.
-pythonpath = ["."]
+# lists; `scripts/` too, so the server drivers (which have no console-script entry point,
+# unlike the installed `cmreg` package) are importable from a test. `[tool.pyright]` above
+# repeats the second path -- the two tools do not share one.
+pythonpath = [".", "scripts"]
 markers = [
     "slow: long-running tests (matcher smoke runs, end-to-end benchmark cells); deselect with -m 'not slow'",
 ]

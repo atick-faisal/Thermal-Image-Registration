@@ -132,6 +132,34 @@ _HOW_TO_INGEST = {
 }
 
 
+def _refuse_a_stale_run(cell: Cell, run_dir: Path) -> None:
+    """Refuse to resume onto a run directory that was scored under a different `R` policy.
+
+    The skip above exists so an interrupted run picks up where it stopped. It cannot tell that
+    apart from a *stale* run, and P2-12 created exactly that case: stage-A run 2 asked for
+    `flir` composed, found run 1's pre-composition `pairs.parquet` sitting there, skipped the
+    cell, and printed run 1's floors into the composed table under the composed banner. Nothing
+    in the pasted output said so -- an uncomposed row looks exactly like a composed one, which
+    is the same failure mode P3-7's F1 is the record of.
+
+    Raising rather than re-running: the stale directory is 25-35 min of GPU time and deleting
+    it is the operator's call, not a driver's side effect.
+    """
+    from cmreg.gt import load_calibration
+    from cmreg.results import read_rows
+
+    wanted = None if cell.calibration is None else load_calibration(cell.calibration).digest()
+    found = read_rows(run_dir)[0].residual_calibration
+    if found == wanted:
+        return
+    raise SystemExit(
+        f"{cell.name}: {run_dir} was scored with residual_calibration={found!r} but this cell "
+        f"now wants {wanted!r} (GRID.md \u00a73). Resuming would tabulate the old rows under the "
+        f"new banner. Delete the directory to re-run it:\n"
+        f"  rm -rf {run_dir}     (PowerShell: Remove-Item -Recurse -Force {run_dir})"
+    )
+
+
 def run(cell: Cell, device: str, dry: DryRun) -> bool:
     """Run one dataset cell. False when it was skipped for want of a manifest."""
     run_dir = Path("runs") / cell.name
@@ -152,6 +180,7 @@ def run(cell: Cell, device: str, dry: DryRun) -> bool:
             f"`uv run python scripts/p3b_calibrate.py --datasets {cell.dataset}` first."
         )
     if (run_dir / "pairs.parquet").exists():
+        _refuse_a_stale_run(cell, run_dir)
         print(f"########## SKIP {cell.name} (already complete) ##########", flush=True)
         return True
 
@@ -214,6 +243,9 @@ def cross_dataset_table(cells: list[Cell]) -> str:
         # the kind of error a pasted block carries forever.
         scored[cell.dataset] = next(iter(summaries.values())).n_pairs
 
+    # Named rather than counted: a reader of a pasted table cannot otherwise tell a composed
+    # column from an uncomposed one, and the two are not comparable across a row.
+    composed = ", ".join(c.dataset for c in cells if c.composes)
     matchers = list(dict.fromkeys(name for column in columns.values() for name in column))
     width = max(len("matcher"), *(len(name) for name in matchers)) + 2
     header = f"{'matcher':<{width}}" + "".join(f"{name:>16}" for name in columns)
@@ -221,7 +253,8 @@ def cross_dataset_table(cells: list[Cell]) -> str:
     lines = [
         f"=== CMREG STAGE A: {HEADLINE} (px), val split, seed 0 ===",
         f"# pairs scored: {counts}",
-        "# Floors, not accuracies: no R composition (GRID.md §3). Compare down a column.",
+        f"# R composed into the GT for: {composed or 'none'} (GRID.md \u00a73). A column with no "
+        "composition is a floor, not an accuracy.",
         header,
         "-" * len(header),
     ]

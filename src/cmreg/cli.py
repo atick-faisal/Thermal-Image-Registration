@@ -41,6 +41,7 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "device": ("runtime", "device"),
     "name": ("runtime", "name"),
     "run_dir": ("runtime", "path"),
+    "group": ("runtime", "group"),
     "wandb": ("runtime", "wandb"),
     "data": ("data", "manifest"),
     "split": ("data", "split"),
@@ -84,6 +85,11 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device")
     parser.add_argument("--name")
     parser.add_argument("--run-dir", dest="run_dir", type=Path)
+    # A label, not a knob: `runtime` is excluded from `config_hash()`. It exists because a
+    # campaign driver runs one config as many cells (P3-8), and W&B aggregates a factorial
+    # cell by `group=` -- leaving every stage under the anchor config's group would file
+    # stage B's runs beside stage A's with nothing distinguishing them.
+    parser.add_argument("--group", help="W&B group for this cell (default: the config's)")
     parser.add_argument("--wandb", action="store_true", default=None)
     # The off switch a campaign config needs: `p3a_baseline_grid.yaml` sets `wandb: true`
     # because X-1 forbids local-only results on the server, and smoke-running that same

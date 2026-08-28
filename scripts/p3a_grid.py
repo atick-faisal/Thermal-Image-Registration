@@ -132,41 +132,73 @@ _HOW_TO_INGEST = {
 }
 
 
-def _refuse_a_stale_run(cell: Cell, run_dir: Path) -> None:
-    """Refuse to resume onto a run directory that was scored under a different `R` policy.
+def intended_hash(argv: list[str]) -> str:
+    """The `config_hash` the cell described by `argv` would stamp on its rows.
 
-    The skip above exists so an interrupted run picks up where it stopped. It cannot tell that
-    apart from a *stale* run, and P2-12 created exactly that case: stage-A run 2 asked for
+    Resolved through `cmreg`'s own parser and override table rather than by rebuilding the
+    config here: a second path to the same answer is a second path that can disagree with the
+    run it is supposed to be checking.
+    """
+    from cmreg.cli import build_parser, overrides_from_args
+    from cmreg.config import Config
+
+    args = build_parser().parse_args(argv)
+    return Config.load(args.config, overrides_from_args(args)).config_hash()
+
+
+def refuse_a_stale_run(run_dir: Path, wanted_hash: str, wanted_calibration: str | None) -> None:
+    """Refuse to resume onto a run directory that was scored under a *different experiment*.
+
+    The skip this guards exists so an interrupted run picks up where it stopped. It cannot tell
+    that apart from a *stale* run, and P2-12 created exactly that case: stage-A run 2 asked for
     `flir` composed, found run 1's pre-composition `pairs.parquet` sitting there, skipped the
     cell, and printed run 1's floors into the composed table under the composed banner. Nothing
-    in the pasted output said so -- an uncomposed row looks exactly like a composed one, which
-    is the same failure mode P3-7's F1 is the record of.
+    in the pasted output said so -- an uncomposed row looks exactly like a composed one.
 
-    Raising rather than re-running: the stale directory is 25-35 min of GPU time and deleting
-    it is the operator's call, not a driver's side effect.
+    The check is on `config_hash`, which covers **every scientific field at once**, so a stage
+    that varies a new axis inherits it: stage B (P3-8) varies the preprocess pair, and a stale
+    directory differing there is exactly as invisible in a printed table as the composition was.
+    `residual_calibration` is inside that hash and is reported separately anyway, because it is
+    the mismatch whose fix an operator has to be told (produce or remove a constant), where the
+    general one only needs the directory named.
+
+    Raising rather than re-running: the stale directory is 25-35 min of GPU time and deleting it
+    is the operator's call, not a driver's side effect.
     """
-    from cmreg.gt import load_calibration
     from cmreg.results import read_rows
 
-    wanted = None if cell.calibration is None else load_calibration(cell.calibration).digest()
-    found = read_rows(run_dir)[0].residual_calibration
-    if found == wanted:
+    row = read_rows(run_dir)[0]
+    if row.config_hash == wanted_hash and row.residual_calibration == wanted_calibration:
         return
+    if row.residual_calibration != wanted_calibration:
+        detail = (
+            f"was scored with residual_calibration={row.residual_calibration!r} but this cell "
+            f"now wants {wanted_calibration!r} (GRID.md \u00a73)"
+        )
+    else:
+        detail = (
+            f"was scored under config_hash {row.config_hash} but this cell resolves to "
+            f"{wanted_hash}"
+        )
     raise SystemExit(
-        f"{cell.name}: {run_dir} was scored with residual_calibration={found!r} but this cell "
-        f"now wants {wanted!r} (GRID.md \u00a73). Resuming would tabulate the old rows under the "
-        f"new banner. Delete the directory to re-run it:\n"
+        f"{run_dir} {detail}. Resuming would tabulate the old rows under the new banner. "
+        f"Delete the directory to re-run it:\n"
         f"  rm -rf {run_dir}     (PowerShell: Remove-Item -Recurse -Force {run_dir})"
     )
 
 
-def run(cell: Cell, device: str, dry: DryRun) -> bool:
-    """Run one dataset cell. False when it was skipped for want of a manifest."""
-    run_dir = Path("runs") / cell.name
-    banner = f"########## {cell.name} -- {cell.why} ##########"
+def run_cell(cell: Cell, run_dir: Path, argv: list[str], banner: str) -> bool:
+    """Run one `cmreg bench` invocation. False when it was skipped for want of a manifest.
+
+    Shared with the stage-B driver (`scripts/p3_stageb_polarity.py`), which differs from this
+    stage only in the flags it puts in `argv` and the directory it puts the rows in. The
+    preconditions -- a manifest, a constant where GRID.md \u00a73 says one is required, and rows
+    that were scored under this same experiment -- are identical for every stage, and a second
+    copy of them is a second place for one to be dropped.
+    """
     if not cell.manifest.exists():
         print(
-            f"########## SKIP {cell.name}: no {cell.manifest} ##########\n"
+            f"########## SKIP {run_dir.name}: no {cell.manifest} ##########\n"
             f"  to produce it -> {_HOW_TO_INGEST[cell.dataset]}",
             flush=True,
         )
@@ -175,16 +207,28 @@ def run(cell: Cell, device: str, dry: DryRun) -> bool:
         # Fatal, not a skip. GRID.md §3 marks this dataset "compose", and running it without
         # the constant produces a table that looks identical and measures the rig.
         raise SystemExit(
-            f"{cell.name}: {cell.calibration} is missing. GRID.md §3 marks {cell.dataset} as "
+            f"{run_dir.name}: {cell.calibration} is missing. GRID.md §3 marks {cell.dataset} as "
             "composing its residual; produce the constant with "
             f"`uv run python scripts/p3b_calibrate.py --datasets {cell.dataset}` first."
         )
     if (run_dir / "pairs.parquet").exists():
-        _refuse_a_stale_run(cell, run_dir)
-        print(f"########## SKIP {cell.name} (already complete) ##########", flush=True)
+        from cmreg.gt import load_calibration
+
+        wanted = None if cell.calibration is None else load_calibration(cell.calibration).digest()
+        refuse_a_stale_run(run_dir, intended_hash(argv), wanted)
+        print(f"########## SKIP {run_dir.name} (already complete) ##########", flush=True)
         return True
 
     print(banner, flush=True)
+    code = main(argv)
+    if code != 0:
+        raise SystemExit(f"{run_dir.name} failed with exit code {code}")
+    return True
+
+
+def run(cell: Cell, device: str, dry: DryRun) -> bool:
+    """One dataset cell of stage A: the anchor config, relabelled for this dataset."""
+    run_dir = Path("runs") / cell.name
     argv = [
         "bench",
         "-c",
@@ -212,10 +256,7 @@ def run(cell: Cell, device: str, dry: DryRun) -> bool:
         argv += ["--limit", str(dry.limit)]
     if dry.matchers is not None:
         argv += ["--matchers", ",".join(dry.matchers)]
-    code = main(argv)
-    if code != 0:
-        raise SystemExit(f"{cell.name} failed with exit code {code}")
-    return True
+    return run_cell(cell, run_dir, argv, f"########## {cell.name} -- {cell.why} ##########")
 
 
 def cross_dataset_table(cells: list[Cell]) -> str:

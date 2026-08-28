@@ -160,6 +160,39 @@ A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher li
 §7, Figure 6) is only worth making across *every* matcher; a hole in that cell is the whole
 finding.
 
+### Stage B's 2x2, and why it is not an optical-only on/off
+
+`scripts/p3_stageb_polarity.py`, driving `p3a_baseline_grid.yaml` itself with
+`--preprocess-ref` / `--preprocess-mov` per cell — stage B's scientific diff from the anchor is
+exactly those two fields, and a second YAML restating the other twenty is how a stage quietly
+redefines its own defaults. (`scripts/p3b_calibrate.py` is P2-12's *calibration* driver, not
+stage B; the run directories here are `runs/stageb_<dataset>_<label>`.)
+
+| label | reference / moving | relative polarity |
+|---|---|---|
+| `neither` | `none` / `percentile` | as captured |
+| **`optical`** | **`invert` / `percentile`** | flipped — **the anchor recipe (§1)** |
+| `thermal` | `none` / `percentile_invert` | flipped |
+| `both` | `invert` / `percentile_invert` | as captured |
+
+A matcher sees *relative* polarity, so inverting both sides restores the relation inverting
+neither had, and the four cells fall into two pairs. If relative polarity is the whole story,
+`optical` and `thermal` agree and `neither` and `both` agree; if inverting the *optical image
+specifically* is what helps — which is what PLAN.md §15B's recipe asserts — they do not,
+because the two members of a pair differ only in which side carries the inversion. An
+optical-only on/off (8 cells) cannot separate those two readings, and only the second licenses
+"invert the optical grayscale" as a recipe rather than as a coincidence of this data. The
+driver prints that comparison as a `within` / `across` / `ratio` block beside Figure 6's
+per-matcher improvement count.
+
+The percentile normalisation stays on the thermal side in all four, so the axis varied is
+polarity alone; upsampling stays at ×1 (that is stage C).
+
+Stage A's anchor cells are **not** reused as this stage's `optical` column, though their
+`config_hash` is identical and the resume guard would verify it: run 2's `llvip` and
+`dronevehicle` rows carry `e60e196-dirty`, and re-running costs ~1.9 h against sixteen cells
+that then share one code state.
+
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
 

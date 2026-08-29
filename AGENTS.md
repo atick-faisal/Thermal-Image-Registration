@@ -15,6 +15,10 @@
 6. Mark the task done in `TASKS.md`, commit with a gitmoji + conventional message, stop.
 7. Wait for verification before starting the next step.
 
+Server runs come back as console text only. Save each one to
+`logs/<YYYY-MM-DD>-<task>-<what-ran>.txt` — `logs/` is git-ignored, and a log left in the
+repository root stamps every subsequent run's `git_sha` with `-untracked`.
+
 ## House style
 
 Adopted wholesale from `../Thermal-To-Optical-Translation/PLAN.md` §13.

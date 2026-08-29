@@ -18,7 +18,7 @@ file and the axis named in it.
 | pairs | **300, `subsample_seed: 0`** | see §4 |
 | moving / reference | thermal / optical | the production direction (PLAN.md §15B); thermal is the harder, lower-resolution side and warping optical instead flatters every number |
 | Tier-1 warp | ±30°, scale 0.8–1.25 log-uniform, perspective 0.05, translation 0.05 | PLAN.md §5's full range. P3-7 once suspected this range of causing `auc_3px = 0`; P1-1a settled that it was not (§3) |
-| preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B) |
+| preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured it as non-optimal on 3 of 4 datasets** and it stays anyway — see below |
 | estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default; the 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
 | warp model | homography | the only one implemented (P3-4 adds the rest, and is stage E's precondition) |
 | `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
@@ -26,6 +26,14 @@ file and the axis named in it.
 
 `experiments/p3a_baseline_grid.yaml` **is** this cell, in the config schema, and every later
 stage is authored as a diff against it.
+
+**The anchor's polarity is a recorded bias, not a neutral choice** (P3-8 F15/F19/F20). It is
+the best of stage B's four polarities in only 13 of 80 (matcher, dataset) cells, and it is the
+*worst* of the four for 19 of 20 matchers on `dronevehicle`. It stays the anchor because the
+matcher *ordering* it produces is polarity-invariant (Spearman 0.87-0.99 against all three
+alternatives, same top-ranked matcher in 4/4 datasets) and re-anchoring would invalidate stage
+A and every stage authored against it, to buy at most 11% on one cell. Quote an absolute
+stage-A number with this caveat, and never as evidence that inverting the optical side helps.
 
 ## 2. The reporting ladder — 3 / 5 / 10 / 20 px, read from 5 up
 
@@ -191,7 +199,18 @@ polarity alone; upsampling stays at ×1 (that is stage C).
 Stage A's anchor cells are **not** reused as this stage's `optical` column, though their
 `config_hash` is identical and the resume guard would verify it: run 2's `llvip` and
 `dronevehicle` rows carry `e60e196-dirty`, and re-running costs ~1.9 h against sixteen cells
-that then share one code state.
+that then share one code state. (That decision paid for itself: all 80 re-run anchor cells
+reproduced stage A to the printed digit, which is the determinism check of P3-8 F22.)
+
+**Stage B ran on 2026-08-28 and the answer is a negative one.** Neither reading survives as a
+recipe. `optical` and `thermal` do land ~3x closer together than either does to `neither` /
+`both` on three of four datasets, so what a matcher responds to is the *relation* between the
+sides rather than which side was inverted — but the relation that wins is a property of the
+dataset (`msrs` wants them to disagree, `flir` and `dronevehicle` want them to agree) and, on
+`flir`, of the matcher family (the classical arm wants the opposite of every learned one). The
+matchers a reduced-8 would pick barely respond at all: `matchanything-roma` spans 1.02-1.41x
+across the four cells where `disk-lightglue` spans 8.04x. Full record and F15-F22 in TASKS.md
+P3-8; the consequences that land here are the §1 anchor note above and the §7 rewrite below.
 
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
@@ -203,22 +222,27 @@ version of this section said it should be. The projection it replaces summed the
 timings to 144.6 s/pair for all 20 matchers and assumed a 30-50x A100 speedup; the speedup is
 **20-29x**, so every row below is ~1.45x its predecessor.
 
-| dataset | resolution | s/pair, 20 matchers | 300 pairs |
-|---|---|---|---|
-| `flir` | 640x512 | 5.0 | 25 min |
-| `msrs` | 640x480 | 5.1 | 25 min |
-| `dronevehicle` | 640x512 | 5.2 | 26 min |
-| `llvip` | **1280x1024** | **7.3** | 37 min |
+**Budget against the wall-clock column.** The `time/total_ms` column is matcher time only;
+stage B's sixteen cells measured 1.38-1.58x it, because loading 20 backends, reading the images
+and finalising the W&B run are charged **per cell rather than per pair** (P3-8's cost revision).
+
+| dataset | resolution | s/pair, 20 matchers | 300 pairs, matcher time | **300 pairs, wall clock** |
+|---|---|---|---|---|
+| `flir` | 640x512 | 5.0 | 25 min | **34.5 min** |
+| `msrs` | 640x480 | 5.1 | 25 min | **35.2 min** |
+| `dronevehicle` | 640x512 | 5.2 | 26 min | **38.2 min** |
+| `llvip` | **1280x1024** | **7.3** | 37 min | **58.4 min** |
 
 | stage | pairs scored | cost |
 |---|---|---|
-| A | 1,200 | **~1.9 h**, measured |
-| B | 4,800 | ~7.5 h, scaled from A at 5.65 s/pair |
-| C-D | reduced-8, ~16,800 | still roughly a day each; the reduced-8 subset's own rate is not measured yet |
+| A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
+| B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
+| C-D | reduced-8, ~16,800 | still roughly a day each; the reduced-8 subset's own rate is not measured yet, and its **per-cell** overhead is the larger unknown -- stage C is 32 cells against stage B's 16 |
 
-Resolution is the only variable that moves the per-pair cost materially -- three 640-wide sets
+Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget
-should be read off its resolution, not off the mean.
+should be read off its resolution, not off the mean. Cell *count* is the other half of the
+estimate and does not scale with pairs at all.
 
 ## 8. What this grid does not cover
 

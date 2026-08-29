@@ -44,6 +44,26 @@ CONFIG = "experiments/p3a_baseline_grid.yaml"
 HEADLINE = "reg/mace"
 
 
+# `experiments/GRID.md` §6's named matcher subset for stages C-G: the two best cross-modal
+# families, the two semi-dense entries, the strongest sparse learned arm, the runtime outlier,
+# and the classical floor. Named there "so no stage picks its own" -- it lives here rather than
+# in the stage that first consumes it (P3-9) for the same reason.
+#
+# TODO: this module is the de-facto shared one for every stage driver (`run_cell`,
+# `refuse_a_stale_run`, `DryRun`, `CELLS`, and now this). Extract `scripts/stages.py` when stage
+# D becomes the third consumer; two is not yet worth the churn.
+REDUCED_8 = (
+    "roma",
+    "minima-roma",
+    "matchanything-roma",
+    "eloftr",
+    "xoftr",
+    "superpoint-lightglue",
+    "xfeat",
+    "sift",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Cell:
     dataset: str

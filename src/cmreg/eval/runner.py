@@ -461,6 +461,25 @@ def _failed_row(
     )
 
 
+def _variant_label(config: Config) -> str:
+    """The preprocessing/estimation recipe, as the one token that names a cell in W&B.
+
+    The interpolation kernel appears **only above x1**. At x1 `preprocess.upsample` returns the
+    input untouched, so the kernel is genuinely inert there and omitting it hides nothing --
+    while including it unconditionally would rename every stage-A and stage-B run, which are all
+    x1, and a W&B project whose run names drift between stages is one nobody can read across
+    them. Above x1 it is load-bearing: stage C (P3-9) varies the kernel at a fixed factor, and
+    without it four cells would collide into one run name (X-2).
+    """
+    label = (
+        f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
+        f"-x{config.preprocess.moving_upsample}"
+    )
+    if config.preprocess.moving_upsample > 1:
+        label += f"-{config.preprocess.moving_interpolation.value}"
+    return f"{label}-{config.estimate.method.value}"
+
+
 def _publish(config: Config, summaries: Sequence[Summary]) -> None:
     """Send each summary to W&B and print its console block.
 
@@ -468,12 +487,9 @@ def _publish(config: Config, summaries: Sequence[Summary]) -> None:
     local run directory; the W&B name is *derived*, because a campaign that overrides the
     matcher on the command line would otherwise file every cell under one name.
     """
+    variant = _variant_label(config)
     for summary in summaries:
         matcher = summary.context["matcher"]
-        variant = (
-            f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
-            f"-x{config.preprocess.moving_upsample}-{config.estimate.method.value}"
-        )
         cell = config.model_copy(
             update={
                 "runtime": config.runtime.model_copy(

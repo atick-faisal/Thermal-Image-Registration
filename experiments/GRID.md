@@ -147,7 +147,11 @@ Wilcoxon needs them); a scoping row does not.
 `reduced-8` = `roma`, `minima-roma`, `matchanything-roma`, `eloftr`, `xoftr`,
 `superpoint-lightglue`, `xfeat`, `sift` — the two best cross-modal families, the two
 semi-dense entries, the strongest sparse learned arm, the runtime outlier, and the classical
-floor. Named here so no stage picks its own.
+floor. Named here so no stage picks its own, and defined once in code as
+`scripts/p3a_grid.py::REDUCED_8` so no stage can restate it differently.
+
+`responsive-4` = `eloftr`, `xoftr`, `xfeat`, `sift` — the members of reduced-8 whose input
+resolution actually reaches the model. Stage C's subsection below is where that is measured.
 
 `driving+aerial` = `flir` + `dronevehicle`: the best-characterised driving set (P1-1c/d) and
 the only aerial one.
@@ -156,7 +160,7 @@ the only aerial one.
 |---|---|---|---|---|---|---|
 | **A** | — (the anchor itself) | all 20 | all 4 | 4 | 1 | P3-7 |
 | B | `invert` on/off, both sides | all 20 | all 4 | 16 | 1 | P3-8 |
-| C | upsample x1/2/3/4 x 4 kernels | reduced-8 | driving+aerial | 32 | 1 | P3-9 |
+| **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 | **5** | P3-10 |
 | E | homography / affine / similarity / TPS / H+flow | reduced-8 | driving+aerial | 10 | 1 | P3-11 |
 | F | input resolution x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
@@ -212,6 +216,39 @@ matchers a reduced-8 would pick barely respond at all: `matchanything-roma` span
 across the four cells where `disk-lightglue` spans 8.04x. Full record and F15-F22 in TASKS.md
 P3-8; the consequences that land here are the §1 anchor note above and the §7 rewrite below.
 
+### Stage C's grid, and why it is 26 cells rather than 32
+
+`scripts/p3c_upsample.py`, driving `p3a_baseline_grid.yaml` with `--upsample` /
+`--interpolation` per cell. Two departures from the naive 4×4, both measured rather than
+assumed (TASKS.md P3-9):
+
+**The ×1 column is one cell, not four.** `preprocess.upsample` returns the input untouched at
+×1, so the four kernels there produce a bit-identical image; the collapse is exact. It is run
+under the anchor kernel and shared across all four kernel tables, and the derived W&B run name
+drops the kernel at ×1 for the same reason (`eval/runner.py::_variant_label`). 16 → 13 per
+dataset.
+
+**The kernel axis runs on the resolution-responsive four.** Half of reduced-8 resizes its
+inputs to a fixed internal resolution and therefore cannot see a resolution change at all:
+`roma` / `minima-roma` fix 560×560 (`romatch/models/matcher.py:617`), SuperPoint fixes a
+1024 px long side (`LightGlue/lightglue/superpoint.py:115`), and `matchanything-roma` is flat
+by measurement. Sixteen times the input pixels for the same milliseconds is the evidence, and
+it is not subtle — `matchanything-roma` reads 19,219 / 19,135 / 19,387 / 19,452 ms across
+×1–×4 while `eloftr` reads 943 / 2,360 / 4,238 / 12,282. For those four the axis is a *resample
+prefilter*, so they stay in the anchor-kernel factor column — which is what measures that
+prefilter at 300 pairs — and sit out the three other kernels, which they would otherwise
+dominate at ~93% of the stage's runtime.
+
+**`xoftr` is capped at ×3.** Its positional encoding is a fixed 256 cells at 1/8 stride, so
+2048 px is the ceiling; ×4 on either 640-wide dataset raises
+(`XoFTR/src/xoftr/utils/position_encoding.py:36`). It is dropped from the ×4 cells rather than
+left to produce 300 `matcher_raised` rows and 300 logged tracebacks in a console that reaches
+the Mac by copy-paste, and every table it affects names the exclusion (X-4).
+
+The consequence for reading the stage: a kernel column and the anchor column carry different
+matcher sets, so compare *within* a column, and take the four-kernel comparison only over the
+responsive four. The driver's `axis_block` does exactly that, and says so in its header.
+
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
 
@@ -237,7 +274,8 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 |---|---|---|
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
-| C-D | reduced-8, ~16,800 | still roughly a day each; the reduced-8 subset's own rate is not measured yet, and its **per-cell** overhead is the larger unknown -- stage C is 32 cells against stage B's 16 |
+| C | reduced-8 / responsive-4, 7,800 | **~3.5 h projected.** The reduced-8 subset is 47.6% of the 20-matcher rate (summing P0-2's per-matcher timings), so ~2.4 s/pair on the anchor column; the nine kernel-axis cells carry only the four cheap responsive entries and cost ~7% of that. Upsampling does **not** scale the bill the way it looks like it should -- four of the eight backends are flat in the factor, and the four that are not are the cheap ones (`eloftr` ×13 of 943 ms, `sift` ×6.4 of 35 ms). Per-cell overhead dominates instead: 26 cells |
+| D | reduced-8, ~36,000 | still roughly a day; 24 cells × 5 seeds, and the reduced-8 rate above is now the handle for it |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget

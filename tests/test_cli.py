@@ -31,6 +31,16 @@ def test_override_table_nests_by_dotted_path() -> None:
     }
 
 
+def test_the_upsampling_axis_is_expressible_from_the_command_line() -> None:
+    """P3-9's stage C varies exactly these two fields against the anchor config, so a missing
+    flag would force a second YAML -- which is how a stage quietly redefines its own defaults
+    (GRID.md ss1)."""
+    args = build_parser().parse_args(["bench", "--upsample", "3", "--interpolation", "lanczos"])
+    assert overrides_from_args(args) == {
+        "preprocess": {"moving_upsample": 3, "moving_interpolation": "lanczos"}
+    }
+
+
 def test_gt_writes_records_and_a_config_snapshot(manifest_path: Path, tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     assert (

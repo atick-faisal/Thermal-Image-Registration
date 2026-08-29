@@ -15,6 +15,7 @@ import pytest
 
 import p3_stageb_polarity
 import p3a_grid  # on the path via `[tool.pytest.ini_options] pythonpath`
+import p3c_upsample
 from cmreg.results import write_rows
 from tests.test_results import make_row
 
@@ -145,3 +146,94 @@ def _polarity_table(mace: dict[str, float]) -> p3_stageb_polarity.Table:
 def _row_for(dataset: str, block: str) -> list[str]:
     (line,) = [row for row in block.splitlines() if row.startswith(dataset)]
     return line.split()
+
+
+class TestStageC:
+    """`scripts/p3c_upsample.py` (P3-9). Same two things as stage B -- the cell enumeration and
+    the arithmetic of the summary blocks -- plus the matcher policy, which is the one part of
+    this stage a reader of the pasted table cannot check for themselves."""
+
+    def test_the_grid_is_thirteen_cells_per_dataset_with_distinct_directories(self) -> None:
+        settings = p3c_upsample.grid(p3c_upsample.FACTORS, p3c_upsample.KERNELS)
+        assert len(settings) == 13
+        dirs = [
+            p3c_upsample.run_dir_for(cell, setting)
+            for cell in p3a_grid.CELLS
+            for setting in settings
+        ]
+        assert len(set(dirs)) == len(dirs)
+
+    def test_the_x1_cell_is_shared_across_every_kernel(self) -> None:
+        """The collapse is exact -- at x1 `preprocess.upsample` returns the input untouched, so
+        four kernel cells would be four copies of one run. If it were ever enumerated per
+        kernel, the stage would pay for three redundant cells and W&B would hold four runs
+        claiming different recipes for identical images."""
+        settings = p3c_upsample.grid(p3c_upsample.FACTORS, p3c_upsample.KERNELS)
+        assert len([s for s in settings if s.factor == 1]) == 1
+        for kernel in p3c_upsample.KERNELS:
+            columns = p3c_upsample.columns_for(kernel, settings)
+            assert columns[0].label == "x1"
+
+    def test_only_the_anchor_kernel_carries_the_resolution_blind_matchers(self) -> None:
+        """The design's load-bearing claim (module docstring): `roma`, `minima-roma`,
+        `matchanything-roma` and `superpoint-lightglue` resize their inputs internally, so a
+        kernel row for them measures a resample prefilter and costs ~93% of the stage."""
+        anchor = p3c_upsample.Setting(2, p3c_upsample.ANCHOR_KERNEL)
+        other = p3c_upsample.Setting(2, "nearest")
+        assert set(anchor.matchers) == set(p3a_grid.REDUCED_8)
+        assert set(other.matchers) == set(p3c_upsample.RESPONSIVE)
+        assert not set(other.matchers) & set(p3c_upsample.RESOLUTION_BLIND)
+
+    def test_xoftr_is_dropped_above_its_architectural_ceiling(self) -> None:
+        """XoFTR's positional encoding caps at 2048 px, so x4 on a 640-wide set raises. Dropped
+        rather than left to fail 300 times -- and named in `excluded`, because X-4 makes this a
+        recorded exclusion rather than a silent one."""
+        assert "xoftr" in p3c_upsample.Setting(3, "nearest").matchers
+        assert "xoftr" not in p3c_upsample.Setting(4, "nearest").matchers
+        assert p3c_upsample.Setting(4, "nearest").excluded == ("xoftr",)
+
+    def test_the_recipe_block_counts_the_matchers_upsampling_helps(self) -> None:
+        """PLAN.md §15B's claim is a count across matchers, exactly as Figure 6's was: one
+        matcher helped a great deal must not average away one it hurts."""
+        table = {
+            "x1": {"roma": _metrics(25.0), "sift": _metrics(20.0)},
+            "x3_bicubic": {"roma": _metrics(5.0), "sift": _metrics(30.0)},
+        }
+        row = _row_for("flir", p3c_upsample.recipe_block({"flir": table}))
+        assert row[1] == "1/2"  # roma improved by 20 px, sift got 10 px worse
+        assert row[2] == "5.00"  # median of [+20, -10]
+
+    def test_a_factor_effect_with_no_kernel_effect_reports_a_large_ratio(self) -> None:
+        """The reading the block exists for: if every kernel gives the same number and the
+        factor moves it, the kernel is a free choice for stages D-G. Built so the kernels agree
+        exactly at each factor and the factors differ."""
+        block = p3c_upsample.axis_block({"flir": _upsample_table({2: 10.0, 3: 30.0})}, _SETTINGS)
+        row = _row_for("flir", block)
+        assert row[1] == "0.00"  # every kernel agrees at a fixed factor
+        assert row[2] == "20.00"  # x1 20 -> x2 10 -> x3 30 spans 20 px
+        assert row[3] == "inf"
+
+    def test_a_kernel_effect_is_not_reported_as_a_factor_effect(self) -> None:
+        """The alternative the block has to separate: the kernels disagree as much as the
+        factors do, so the ratio lands near 1 and the paper has to report the kernel."""
+        table = _upsample_table({2: 10.0, 3: 30.0}, kernel_offsets={"nearest": 20.0})
+        row = _row_for("flir", p3c_upsample.axis_block({"flir": table}, _SETTINGS))
+        assert row[1] == "20.00"
+        assert row[3] == "1.00"
+
+
+_SETTINGS = p3c_upsample.grid((1, 2, 3), p3c_upsample.KERNELS)
+
+
+def _upsample_table(
+    mace: dict[int, float], kernel_offsets: dict[str, float] | None = None
+) -> p3c_upsample.Table:
+    """One matcher, `reg/mace` keyed by factor, optionally shifted for named kernels. Only
+    `eloftr` is populated: it is in `RESPONSIVE`, which is the population `axis_block` reads."""
+    offsets = kernel_offsets or {}
+    table: p3c_upsample.Table = {"x1": {"eloftr": _metrics(20.0)}}
+    for setting in _SETTINGS:
+        if setting.factor > 1:
+            value = mace[setting.factor] + offsets.get(setting.kernel, 0.0)
+            table[setting.label] = {"eloftr": _metrics(value)}
+    return table

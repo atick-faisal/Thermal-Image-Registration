@@ -18,6 +18,7 @@ import pytest
 
 from cmreg.config import Config, Variant
 from cmreg.eval import RunnerError, run_benchmark
+from cmreg.eval.runner import _variant_label
 from cmreg.gt import generator, sample_homography
 from cmreg.results import FILENAME, read_rows
 
@@ -50,19 +51,44 @@ def test_identical_modalities_register_to_subpixel(aligned_dataset: Path, tmp_pa
 
 
 @pytest.mark.parametrize("factor", [2, 3])
+@pytest.mark.parametrize("kernel", ["nearest", "bilinear", "bicubic", "lanczos"])
 def test_upsampling_does_not_inflate_the_reported_error(
-    aligned_dataset: Path, tmp_path: Path, factor: int
+    aligned_dataset: Path, tmp_path: Path, factor: int, kernel: str
 ) -> None:
     """The scale-plumbing pin. Keypoints found in an upsampled image are not in native pixels;
     if the runner failed to map them back, every metric would be inflated by ``factor`` and
-    the P3-9 ablation would report interpolation as catastrophic."""
+    the P3-9 ablation would report interpolation as catastrophic.
+
+    Run across all four kernels because stage C varies them: the mapping is
+    ``(j + 0.5) / scale - 0.5`` for every one of them, so a kernel that failed here would mean
+    the resampler and the coordinate convention disagree rather than that the kernel is poor.
+    """
     config = base_config(
         aligned_dataset / "data.yaml",
-        tmp_path / f"run{factor}",
-        preprocess={"moving_upsample": factor},
+        tmp_path / f"run{factor}{kernel}",
+        preprocess={"moving_upsample": factor, "moving_interpolation": kernel},
     )
     (summary,) = run_benchmark(config)
     assert summary.metrics["reg/mace"] < SUBPIXEL_PX
+
+
+@pytest.mark.parametrize(
+    ("factor", "expected"),
+    [(1, "none-none-x1-magsac"), (2, "none-none-x2-lanczos-magsac")],
+)
+def test_the_interpolation_kernel_names_a_cell_only_where_it_acts(
+    aligned_dataset: Path, tmp_path: Path, factor: int, expected: str
+) -> None:
+    """The W&B run name is derived, so two cells differing only in kernel must not collide
+    under one name (X-2). At x1 they cannot differ at all -- ``upsample`` returns the input
+    untouched -- so the kernel is omitted there, which is what keeps every stage-A and stage-B
+    run name (all x1) unchanged by this."""
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / f"run{factor}",
+        preprocess={"moving_upsample": factor, "moving_interpolation": "lanczos"},
+    )
+    assert _variant_label(config) == expected
 
 
 def test_swapping_which_modality_moves_gives_the_same_answer(

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cmreg import __version__
-from cmreg.config.schema import Domain, Estimator, Modality, Platform, Variant
+from cmreg.config.schema import Domain, Estimator, Interpolation, Modality, Platform, Variant
 
 logger = logging.getLogger("cmreg")
 
@@ -32,6 +32,7 @@ DATASET_ROOT = Path(
 )
 
 _VARIANTS = [v.value for v in Variant]
+_INTERPOLATIONS = [i.value for i in Interpolation]
 _MODALITIES = [m.value for m in Modality]
 _DOMAINS = [d.value for d in Domain]
 _PLATFORMS = [p.value for p in Platform]
@@ -57,6 +58,7 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "preprocess_ref": ("preprocess", "reference"),
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
+    "interpolation": ("preprocess", "moving_interpolation"),
     "domain": ("eval", "domain"),
     "platform": ("eval", "platform"),
 }
@@ -131,6 +133,14 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
     parser.add_argument("--preprocess-mov", dest="preprocess_mov", choices=_VARIANTS)
     parser.add_argument("--upsample", type=int, help="thermal upsampling factor (1-8)")
+    # The second half of stage C's axis (P3-9). Inert at `--upsample 1`, where
+    # `preprocess.upsample` returns the input untouched -- which is why the derived W&B run
+    # name carries the kernel only above x1 (`eval/runner.py::_publish`).
+    parser.add_argument(
+        "--interpolation",
+        choices=_INTERPOLATIONS,
+        help="resampling kernel for that upsampling",
+    )
     # Labels, not knobs -- but a campaign that points one config at four datasets has to
     # relabel them per cell, and a `dronevehicle` row filed as `driving/public` is pooled
     # into the easy domain and silently hides the hard case (`scripts/p3a_grid.py`).

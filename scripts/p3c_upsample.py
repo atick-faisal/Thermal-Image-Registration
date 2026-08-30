@@ -6,6 +6,14 @@ first half and returned a negative result -- inversion is the best of four polar
 80 (matcher, dataset) cells. This stage measures the second half: **does upsampling the thermal
 side help, and does the interpolation kernel matter?**
 
+**It ran on 2026-08-29 and the answer is no, twice over** (TASKS.md P3-9, F23-F30). x3 bicubic
+improves 3 of 8 matchers on flir and 2 of 8 on dronevehicle, never by over 7.4%, while costing
+up to 27x. It is not a resolution gain: the runner only scores pairs whose modalities already
+share a shape and the reference side is never resized, so xN is an Nx *scale mismatch* between
+the views -- inert for a backend that resizes internally, absorbed by sift's scale-space
+pyramid, and fatal for a fixed-stride learned matcher (success@10px 0.72/0.84/0.43 -> 0.16/
+0.13/0.00 for eloftr/xoftr/xfeat). The factor beats the kernel 14-20x. Kept as it ran.
+
     uv run python scripts/p3c_upsample.py
     uv run python scripts/p3c_upsample.py --datasets flir --factors 1 3
 
@@ -15,27 +23,36 @@ scientific diff from the anchor is exactly the fields it varies, and a second YA
 the other twenty is how a stage quietly redefines its own defaults (P3-1).
 
 **Half of reduced-8 cannot see a resolution change at all**, which is what shapes the grid.
-Measured on the Mac before the server trip (`--limit 1`, flir val, x1 -> x4 bicubic, ms):
+Four backends resize their inputs to a fixed internal resolution, and the source says so:
+`roma`/`minima-roma` fix 560x560 (`romatch/models/matcher.py:617`), SuperPoint fixes a 1024 px
+long side (`LightGlue/lightglue/superpoint.py:115`), and `matchanything-roma` was flat by
+measurement. For those four the upsampling axis is a **resample prefilter**, not a resolution
+change, so they sit out the kernel axis; the anchor-kernel factor column keeps all eight, which
+is where the prefilter effect gets its 300-pair number.
 
-    matchanything-roma  19219 -> 19135 -> 19387 -> 19452   flat
-    superpoint-lightglue 3139 ->  3141 ->  3180 ->  3161   flat
-    roma                20460 ->              20252        flat  (x3)
-    minima-roma         24692 ->              24705        flat  (x3)
-    eloftr                943 ->  2360 ->  4238 -> 12282   x13.0
-    xoftr                1148 ->  2244 ->  3993 -> raises  x3.5, then a hard ceiling
-    xfeat                 101 ->   201 ->   337 ->   603   x6.0
-    sift                   35 ->    65 ->   144 ->   225   x6.4
+That premise was chosen on a Mac-CPU probe (`--limit 1`, flir val, x1 -> x4 bicubic, ms) and
+**the accuracy half of it held while the cost half did not** (P3-9 F28). The 300-pair GPU run:
 
-Sixteen times the input pixels for the same milliseconds is only possible if the backend
-resizes internally, and the source says so in all four cases: `roma`/`minima-roma` fix
-560x560 (`romatch/models/matcher.py:617`), SuperPoint fixes a 1024 px long side
-(`LightGlue/lightglue/superpoint.py:115`), and `matchanything-roma` is flat by measurement.
-For those four the upsampling axis is a **resample prefilter**, not a resolution change; on 4
-flir pairs it moves `reg/mace` by 1.4-7.6% across factors and 4.0-5.3% across kernels.
+    matcher               CPU x1 -> x4        CPU     GPU x1 -> x4       GPU
+    matchanything-roma  19219 -> 19452       flat      387 ->  537      x1.39
+    superpoint-lightglue 3139 ->  3161       flat      101 ->  127      x1.26
+    roma                20460 -> 20252 (x3)  flat      979 -> 1993      x2.04
+    minima-roma         24692 -> 24705 (x3)  flat      799 ->  985      x1.23
+    eloftr                943 -> 12282      x13.0      102 ->  238      x2.33
+    xoftr                1148 -> raises       x3.5     109 ->  266 (x3) x2.44
+    xfeat                 101 ->   603       x6.0       68 ->  106      x1.56
+    sift                   35 ->   225       x6.4      134 ->  485      x3.62
 
-So the kernel axis runs on the resolution-responsive four only, and the anchor-kernel factor
-column keeps all eight -- which is where the prefilter effect gets its 300-pair number, and
-where the flat rows become the evidence for this design rather than an assumption behind it.
+Nothing is cost-flat on the GPU. CPU cost is dominated by matching FLOPs; GPU cost is dominated
+by the fixed per-pair pipeline -- `cv2.resize`, the host->device transfer, and the backend's own
+internal resize -- all of which scale with the input pixel count while the matching does not.
+`sift` is CPU-bound even under `--device cuda`, which is the control that says so: it is the
+steepest GPU row.
+
+So **read this grid's design off accuracy invariance, not off runtime.** That is what held: the
+four resize-internally backends move `reg/mace` by <=2.8% on flir and <=14.8% on dronevehicle
+across the whole factor axis, with no consistent direction -- a prefilter, exactly as intended,
+and four kernel columns of it would have bought four indistinguishable rows.
 
 **`xoftr` cannot run above x3.** Its positional encoding is a fixed 256 cells at 1/8 stride, so
 2048 px is the ceiling and 640x4 raises `RuntimeError: The size of tensor a (320) must match
@@ -45,8 +62,8 @@ runner would turn each into a `matcher_raised` row with a logged traceback, and 
 in a console that reaches the Mac by copy-paste is a log nobody can read. The exclusion is
 stated in every table it affects (X-4 -- recorded, not silently dropped).
 
-Needs a GPU: ~3.5 h for 26 cells. `--device cpu` with the dry-run overrides is how the
-plumbing is proved before the trip.
+Needs a GPU: **4 h 34 min for 26 cells, measured** (~3.5 h was projected from matcher time
+alone). `--device cpu` with the dry-run overrides is how the plumbing is proved before the trip.
 
 Every block it prints is meant to be copied out of the console whole.
 """
@@ -358,17 +375,23 @@ def axis_block(tables: dict[str, Table], settings: tuple[Setting, ...]) -> str:
 def cost_block(tables: dict[str, Table], settings: tuple[Setting, ...]) -> str:
     """Mean `time/total_ms` per (matcher, factor) at the anchor kernel.
 
-    Upsampling is the one preprocessing axis that buys accuracy with runtime, so the trade-off
-    is the finding rather than an aside, and it feeds P3-14 and Figure 11. It is also the
-    300-pair confirmation of the flat runtimes this stage's design rests on: a backend that
-    resizes internally costs the same at x4 as at x1, and one that does not, does not.
+    Upsampling is the one preprocessing axis that could buy accuracy with runtime, so the
+    trade-off is the finding rather than an aside, and it feeds P3-14 and Figure 11.
+
+    It also refuted the cost half of this stage's own design premise (P3-9 F28). The premise was
+    "a backend that resizes internally costs the same at x4 as at x1", measured on the Mac CPU;
+    on the GPU **every** row rises, by x1.23 to x3.62, because what scales there is the fixed
+    per-pair pipeline rather than the matching. Do not read internal-resize behaviour off this
+    block -- read it off the accuracy tables above, where it is what the design actually rests on.
     """
     columns = columns_for(ANCHOR_KERNEL, settings)
     labels = [s.label for s in columns]
     lines = [
         f"=== CMREG STAGE C: {TIME_TOTAL_MS} by upsampling factor ({ANCHOR_KERNEL}) ===",
-        "# flat across the row = the backend resizes its input internally, so the factor is a",
-        "#   prefilter for it and not a resolution change.",
+        "# every row rises with the factor, including the backends that resize internally: on a",
+        "#   GPU the cost that scales is the fixed per-pair pipeline (resize, transfer, the",
+        "#   backend's own resize), not the matching. `sift` runs on the CPU whatever --device",
+        "#   says, and is the steepest row here -- which is the control for that reading.",
     ]
     # One width for every dataset in the block: a per-dataset width misaligns the second
     # header against the first, and this block is read by eye out of a pasted console.
@@ -407,6 +430,10 @@ def ranking_block(tables: dict[str, Table], settings: tuple[Setting, ...]) -> st
         "=== CMREG STAGE C: is the matcher ranking invariant to upsampling? ===",
         "# Spearman of reg/mace against the x1 column, over the matchers shared with it.",
         "# ~1 means upsampling is a level effect, not an ordering effect (cf. P3-8 F19).",
+        "# READ `n` FIRST. Only the anchor-kernel rows carry all eight matchers; a kernel-axis",
+        "#   row has the responsive four or three, where rho is quantised to a handful of values",
+        "#   (+-1, +-0.5 at n=3) and a matcher set that upsampling has driven into saturation.",
+        "#   A low rho there says the ordering is meaningless, not that it was rearranged.",
         header,
         "-" * len(header),
     ]

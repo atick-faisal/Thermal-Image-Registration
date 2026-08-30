@@ -18,7 +18,7 @@ file and the axis named in it.
 | pairs | **300, `subsample_seed: 0`** | see §4 |
 | moving / reference | thermal / optical | the production direction (PLAN.md §15B); thermal is the harder, lower-resolution side and warping optical instead flatters every number |
 | Tier-1 warp | ±30°, scale 0.8–1.25 log-uniform, perspective 0.05, translation 0.05 | PLAN.md §5's full range. P3-7 once suspected this range of causing `auc_3px = 0`; P1-1a settled that it was not (§3) |
-| preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured it as non-optimal on 3 of 4 datasets** and it stays anyway — see below |
+| preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured the polarity as non-optimal on 3 of 4 datasets** and it stays anyway — see below. **Stage C measured the ×1** and it is the right factor, so the two halves of this row carry opposite caveats |
 | estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default; the 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
 | warp model | homography | the only one implemented (P3-4 adds the rest, and is stage E's precondition) |
 | `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
@@ -34,6 +34,15 @@ matcher *ordering* it produces is polarity-invariant (Spearman 0.87-0.99 against
 alternatives, same top-ranked matcher in 4/4 datasets) and re-anchoring would invalidate stage
 A and every stage authored against it, to buy at most 11% on one cell. Quote an absolute
 stage-A number with this caveat, and never as evidence that inverting the optical side helps.
+
+**The ×1 is the opposite case: measured, and resolved in the anchor's favour** (P3-9 F24/F25).
+Upsampling the thermal side ×3 bicubic — the other half of §15B's recipe — improves 3 of 8
+matchers on `flir` and 2 of 8 on `dronevehicle`, by at most 7.4%, while costing up to 27× on the
+matchers it reaches. It is not a resolution gain at all: the runner only scores pairs whose
+modalities already share a shape (`eval/runner.py:294`) and the reference side is never resized
+(`preprocess/variants.py:185`), so ×N is an N× *scale mismatch* between the two views. The
+recipe survived in the production path it came from because RoMa resizes to 560×560 and threw it
+away. Do not carry the polarity caveat above onto this field.
 
 ## 2. The reporting ladder — 3 / 5 / 10 / 20 px, read from 5 up
 
@@ -161,9 +170,9 @@ the only aerial one.
 | **A** | — (the anchor itself) | all 20 | all 4 | 4 | 1 | P3-7 |
 | B | `invert` on/off, both sides | all 20 | all 4 | 16 | 1 | P3-8 |
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
-| D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 | **5** | P3-10 |
+| D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | homography / affine / similarity / TPS / H+flow | reduced-8 | driving+aerial | 10 | 1 | P3-11 |
-| F | input resolution x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
+| F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -232,12 +241,25 @@ dataset.
 inputs to a fixed internal resolution and therefore cannot see a resolution change at all:
 `roma` / `minima-roma` fix 560×560 (`romatch/models/matcher.py:617`), SuperPoint fixes a
 1024 px long side (`LightGlue/lightglue/superpoint.py:115`), and `matchanything-roma` is flat
-by measurement. Sixteen times the input pixels for the same milliseconds is the evidence, and
-it is not subtle — `matchanything-roma` reads 19,219 / 19,135 / 19,387 / 19,452 ms across
-×1–×4 while `eloftr` reads 943 / 2,360 / 4,238 / 12,282. For those four the axis is a *resample
-prefilter*, so they stay in the anchor-kernel factor column — which is what measures that
-prefilter at 300 pairs — and sit out the three other kernels, which they would otherwise
-dominate at ~93% of the stage's runtime.
+by measurement (its wrapper only pads to a multiple of 32, so the resize is inside the model
+config). For those four the axis is a *resample prefilter*, so they stay in the
+anchor-kernel factor column — which is what measures that prefilter at 300 pairs — and sit out
+the three other kernels, where they would have bought four indistinguishable rows.
+
+**Read that split off accuracy, not off runtime** (P3-9 F28). The design was chosen on a
+Mac-CPU probe where those four were *cost*-flat — `matchanything-roma` read 19,219 / 19,135 /
+19,387 / 19,452 ms across ×1–×4 while `eloftr` read 943 / 2,360 / 4,238 / 12,282 — and on the
+GPU that is simply false: every backend rises with the factor, by ×1.23 (`minima-roma`) to
+×3.62 (`sift`), because what scales on a GPU is the fixed per-pair pipeline (`cv2.resize`, the
+host→device transfer, the backend's own resize) rather than the matching. `eloftr` was the
+steepest CPU row and is mid-table on GPU; `sift`, CPU-bound whatever `--device` says, is the
+steepest GPU row. **A dev-machine cost profile does not transfer to the server and does not
+even preserve the ordering** — state a design premise in the quantity you measured on the device
+that will run it.
+
+What did hold is the accuracy invariance the split actually rests on: across the whole factor
+axis those four move `reg/mace` by ≤2.8% on `flir` and ≤14.8% on `dronevehicle`, with no
+consistent direction.
 
 **`xoftr` is capped at ×3.** Its positional encoding is a fixed 256 cells at 1/8 stride, so
 2048 px is the ceiling; ×4 on either 640-wide dataset raises
@@ -248,6 +270,35 @@ the Mac by copy-paste, and every table it affects names the exclusion (X-4).
 The consequence for reading the stage: a kernel column and the anchor column carry different
 matcher sets, so compare *within* a column, and take the four-kernel comparison only over the
 responsive four. The driver's `axis_block` does exactly that, and says so in its header.
+
+**Stage C ran on 2026-08-29 and the answer is negative, with a mechanism.** ×3 bicubic improves
+3 of 8 matchers on `flir` and 2 of 8 on `dronevehicle`, never by more than 7.4%, while costing
+up to 27×. Upsampling the moving side alone is not a resolution gain but an N× **scale
+mismatch**: pairs are only scored when their modalities already share a shape
+(`eval/runner.py:294`) and the reference is never resized (`preprocess/variants.py:185`). That
+sorts the eight matchers into exactly three groups — resized-internally (unaffected),
+scale-invariant by construction (`sift`, unaffected), and fixed-stride learned (`eloftr`,
+`xoftr`, `xfeat`: destroyed, success@10px 0.72→0.16, 0.84→0.13, 0.43→0.00). The factor dominates
+the kernel 14–20×, and the entire kernel effect is `nearest` costing the two semi-dense entries
+~2×. **Stages D–G therefore run at ×1, where no kernel exists**; a later stage that does resample
+must keep `nearest` away from a semi-dense matcher. Full record and F23–F30 in TASKS.md P3-9;
+what lands here is the §1 note above, the premise correction above that, the stage-F row below
+and the §7 rewrite.
+
+**Stage D is 24 cells but only 10 match passes.** The axis it varies —
+`estimate_homography(..., config.estimate, ...)` at `eval/runner.py:366` — is downstream of the
+matcher, so re-running a matcher per estimator is re-running RoMa twelve times to change a
+RANSAC threshold (~38 h). One match pass per (dataset, seed) feeding twelve estimator calls is
+~4–5 h. The seeds do need re-matching: `config.gt.seed` draws the synthetic warp and `seed_cell`
+seeds the matcher's own sampling. `PairRow` already carries `estimator` and `threshold_px`, so
+the store needs nothing; the `config_hash`/resume semantics of a directory holding twelve
+variants is the open question, and P3-10 records it.
+
+**Stage F must resize *both* sides.** Stage C measured the asymmetric direction and it is
+dominated by scale mismatch (P3-9 F25), so an asymmetric resolution sweep would re-measure that
+rather than resolution. The precondition: `PreprocessConfig` has no reference-side resize field,
+because `preprocess_reference` deliberately never resizes — P3-12 has to add one, or express the
+sweep as a decode-time resize of the pair before the frame is fixed.
 
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
@@ -274,12 +325,15 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 |---|---|---|
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
-| C | reduced-8 / responsive-4, 7,800 | **~3.5 h projected.** The reduced-8 subset is 47.6% of the 20-matcher rate (summing P0-2's per-matcher timings), so ~2.4 s/pair on the anchor column; the nine kernel-axis cells carry only the four cheap responsive entries and cost ~7% of that. Upsampling does **not** scale the bill the way it looks like it should -- four of the eight backends are flat in the factor, and the four that are not are the cheap ones (`eloftr` ×13 of 943 ms, `sift` ×6.4 of 35 ms). Per-cell overhead dominates instead: 26 cells |
-| D | reduced-8, ~36,000 | still roughly a day; 24 cells × 5 seeds, and the reduced-8 rate above is now the handle for it |
+| C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
+| D | reduced-8, ~36,000 | **~4–5 h projected**, not the ~38 h the frozen 120 invocations imply: the estimator axis is downstream of the matcher, so the stage is **10 match passes** (2 datasets × 5 seeds) feeding twelve estimator calls each. See §6 |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget
-should be read off its resolution, not off the mean. Cell *count* is the other half of the
+should be read off its resolution, not off the mean. That rate is for *dataset* resolution, i.e.
+a bigger file decoded and matched; stage C's upsampling enlarges only the preprocessed moving
+image and costs less (`roma` +26% at ×2 against the +45% a 2×-wide dataset would imply), so do
+not budget stage F off this line. Cell *count* is the other half of the
 estimate and does not scale with pairs at all.
 
 ## 8. What this grid does not cover

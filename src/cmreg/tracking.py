@@ -104,7 +104,19 @@ def run_tags(config: Config, matcher: str, preprocess: str, estimator: str, warp
 class RunTracker:
     """Logs to wandb; silently does nothing if ``runtime.wandb`` is off."""
 
-    def __init__(self, config: Config, tags: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        tags: list[str] | None = None,
+        extra_config: dict[str, Any] | None = None,
+    ) -> None:
+        """``extra_config`` describes the *cell* when one config resolves to several.
+
+        P3-10 sweeps the estimator inside a run, so twelve W&B runs share one config object and
+        one ``config_hash`` -- which is deliberate, because that hash is what joins them to
+        their Parquet rows. What the config then cannot say is which of the twelve this run is,
+        and a run name is not a filterable field, so it is logged here instead.
+        """
         self.enabled = config.runtime.wandb
         self._run: Any = None
         if not self.enabled:
@@ -121,14 +133,33 @@ class RunTracker:
         run_dir = Path(config.runtime.path)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        self._run = wandb.init(
-            project=config.runtime.wandb_project,
-            name=config.runtime.name,
-            group=config.runtime.group or None,
-            tags=tags,
-            config=config.to_dict() | {"config_hash": config.config_hash()},
-            dir=str(run_dir),
-        )
+        try:
+            self._run = wandb.init(
+                project=config.runtime.wandb_project,
+                name=config.runtime.name,
+                group=config.runtime.group or None,
+                tags=tags,
+                config=config.to_dict()
+                | {"config_hash": config.config_hash()}
+                | (extra_config or {}),
+                dir=str(run_dir),
+            )
+        except Exception:
+            # The module's first principle, applied to `init` and not only to `log`: telemetry
+            # must not take down a run. It was survivable to let this raise while a cell meant
+            # one run per matcher; P3-10's sweep makes it ~96 inits per cell and ~960 per stage,
+            # so one transient failure four hours in would otherwise discard every console block
+            # the stage exists to print -- after the Parquet is already on disk and the GPU time
+            # already spent. Loud, because X-1 forbids a local-only result and the operator has
+            # to see which run is missing in the console they paste back.
+            logger.exception(
+                "wandb.init failed for run '%s'; continuing without it (X-1: this run has no "
+                "W&B record and the Parquet rows are its only trace)",
+                config.runtime.name,
+            )
+            self.enabled = False
+            return
+
         logger.info(
             "wandb run '%s' initialised under project '%s' (group %s)",
             config.runtime.name,

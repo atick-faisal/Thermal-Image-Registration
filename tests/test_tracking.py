@@ -83,3 +83,24 @@ def test_a_modified_tracked_file_is_dirty(repo: Path) -> None:
     (repo / "tracked.txt").write_text("two\n")
     (repo / "stray.log").write_text("noise\n")
     assert git_sha().endswith("-dirty")
+
+
+def test_a_failing_wandb_init_does_not_take_down_the_run(monkeypatch, tmp_path) -> None:
+    """The module's first principle, applied to `init` rather than only to `log`.
+
+    A P3-10 cell publishes ~96 W&B runs and the stage ~960, all after the GPU work is done and
+    the Parquet is on disk. One transient failure four hours in must not discard every console
+    block the stage exists to print -- but it must be loud, because X-1 forbids a local-only
+    result and the operator has to see which run is missing.
+    """
+    import sys
+    import types
+
+    stub = types.ModuleType("wandb")
+    stub.init = lambda **_: (_ for _ in ()).throw(RuntimeError("network"))  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", stub)
+
+    config = Config.load(overrides={"runtime": {"wandb": True, "path": str(tmp_path)}})
+    with RunTracker(config) as tracker:
+        assert not tracker.enabled
+        tracker.log({"reg/mace": 1.0})  # still inert rather than raising

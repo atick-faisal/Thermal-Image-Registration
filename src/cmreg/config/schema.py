@@ -359,11 +359,23 @@ class MatchConfig(ConfigBase):
 
 
 class EstimateConfig(ConfigBase):
-    """Robust estimation (TASKS.md P3-3). Swept by P3-10."""
+    """Robust estimation (TASKS.md P3-3), and the axis P3-10 sweeps.
 
-    # Which estimator. LMEDS ignores `threshold_px` entirely (it minimises the median residual)
-    # and assumes under 50% outliers -- a threshold sweep row for LMEDS is therefore flat by
-    # construction, which is a property of the method and not a bug in the sweep.
+    The sweep is expressed as two *additive* lists beside the anchor rather than as a list of
+    whole ``EstimateConfig``s, for the reason P3-1 gives: a stage's scientific diff from the
+    anchor is exactly the fields it varies, and anything that lets a stage restate the other
+    twenty fields is how a stage quietly redefines its own defaults. Both lists default to
+    empty, so every config written before they existed still resolves to exactly one variant
+    and means precisely what it meant (X-5).
+    """
+
+    # Which estimator. LMEDS assumes under 50% outliers and fits by minimising the *median*
+    # residual, so `threshold_px` never reaches its solve -- its homography is identical across
+    # a threshold sweep. **Its inlier mask is not**: OpenCV thresholds the mask anyway (measured
+    # on opencv 5.0.0, P3-10), so `n_inliers`, `inlier_ratio`, `reproj_err` and
+    # `estimate/robust.py`'s four-inlier failure gate all move with it -- and a tight threshold
+    # can therefore fail an LMEDS cell whose fit was fine. An LMEDS threshold row is flat in the
+    # geometry and not in the counts, which is a property of OpenCV and not a bug in the sweep.
     method: Estimator = Estimator.MAGSAC
     # Inlier threshold in pixels. PLAN.md §6.4: shrinking this lowers `match/reproj_err`
     # artificially, which is why that metric is reported but never led with.
@@ -375,6 +387,20 @@ class EstimateConfig(ConfigBase):
     # `mask`, and PLAN.md §15A records the upstream harness losing this value to exactly that
     # off-by-one -- its confidence silently stayed at OpenCV's 0.995 default.
     confidence: float = 0.9999
+    # --- the P3-10 sweep axis ----------------------------------------------------------
+    # Which estimators to run. The axis is **downstream of the matcher**:
+    # `eval/runner.py::_evaluate` matches once and then estimates many times off the one
+    # `MatchResult`, so twelve variants cost twelve `cv2.findHomography` calls rather than
+    # twelve match passes. Empty means "not swept". Failure mode: a value left in a config
+    # that is not stage D turns one run directory into twelve variants' worth of rows, which
+    # is visible in the `estimator` column but would surprise anyone reading the row count.
+    sweep_methods: tuple[Estimator, ...] = ()
+    # The threshold half of the same axis, swept independently -- `sweep_methods` alone is
+    # four cells, not twelve. Empty falls back to `threshold_px`. LMEDS ignores this entirely
+    # (see `method` above), so its threshold columns are identical by construction; the stage-D
+    # driver prints that as an explicit check, because a sweep whose knob is not connected to
+    # the solver is exactly the PLAN.md §15A failure this module exists to avoid.
+    sweep_thresholds_px: tuple[float, ...] = ()
 
     @field_validator("threshold_px")
     @classmethod
@@ -396,6 +422,81 @@ class EstimateConfig(ConfigBase):
         if not 0.0 < value < 1.0:
             raise ValueError(f"confidence must be in (0, 1), got {value}")
         return value
+
+    @field_validator("sweep_methods")
+    @classmethod
+    def _unique_methods(cls, value: tuple[Estimator, ...]) -> tuple[Estimator, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"sweep_methods contains duplicates: {value}")
+        return value
+
+    @field_validator("sweep_thresholds_px")
+    @classmethod
+    def _ascending_thresholds(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        if any(t <= 0.0 for t in value):
+            raise ValueError(f"sweep_thresholds_px must all be > 0, got {value}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"sweep_thresholds_px contains duplicates: {value}")
+        # Ascending for the same reason `EvalConfig.thresholds_px` is: the swept values become
+        # the columns of a table that reaches a human by copy-paste, and a column order that
+        # depended on who wrote the config is a table two runs cannot be read across.
+        if list(value) != sorted(value):
+            raise ValueError(f"sweep_thresholds_px must be ascending, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _anchor_is_inside_the_sweep(self) -> Self:
+        """The scalar anchor must be one of the swept cells.
+
+        Without this the scalars are dead weight that still enter ``config_hash`` -- two sweeps
+        differing only in an unused ``method`` would hash apart -- and the anchor block the
+        runner prints (``eval/runner.py::_publish``) would be a thirteenth cell belonging to no
+        table.
+        """
+        if self.sweep_methods and self.method not in self.sweep_methods:
+            raise ValueError(
+                f"method {self.method.value!r} must appear in sweep_methods "
+                f"{[m.value for m in self.sweep_methods]}"
+            )
+        if self.sweep_thresholds_px and self.threshold_px not in self.sweep_thresholds_px:
+            raise ValueError(
+                f"threshold_px {self.threshold_px:g} must appear in sweep_thresholds_px "
+                f"{list(self.sweep_thresholds_px)}"
+            )
+        return self
+
+    @property
+    def is_sweeping(self) -> bool:
+        """True when this config resolves to more than one estimation cell."""
+        return bool(self.sweep_methods or self.sweep_thresholds_px)
+
+    def variants(self) -> tuple[EstimateConfig, ...]:
+        """Every estimation cell this config describes, anchor first on each unswept axis.
+
+        Each variant carries **empty sweep lists**, so it is byte-identical to the config a
+        single-cell run of that estimator would have used -- which is what makes
+        ``tests/test_runner.py``'s claim that a swept run reproduces single-estimator runs row
+        for row a statement about the config layer as well as the runner.
+        """
+        methods = self.sweep_methods or (self.method,)
+        thresholds = self.sweep_thresholds_px or (self.threshold_px,)
+        return tuple(
+            self.model_copy(
+                update={
+                    "method": method,
+                    "threshold_px": threshold,
+                    "sweep_methods": (),
+                    "sweep_thresholds_px": (),
+                }
+            )
+            for method in methods
+            for threshold in thresholds
+        )
+
+    @property
+    def label(self) -> str:
+        """This cell's token in a run name, a W&B group and a console table header."""
+        return f"{self.method.value}@{self.threshold_px:g}px"
 
 
 class Config(ConfigBase):
@@ -443,9 +544,26 @@ class Config(ConfigBase):
         ``runtime`` is excluded wholly, so the same experiment run on two GPUs under two
         names carries one hash -- which is what lets that hash mean anything when it is
         stamped onto a results row.
+
+        **An empty P3-10 sweep is dropped from the payload**, so a config that does not sweep
+        hashes exactly as it did before those fields existed. Without that, adding two
+        defaulted fields would move every hash in the project, and `scripts/stages.py`'s resume
+        guard -- whose whole job is to refuse a directory scored under a *different experiment*
+        -- would refuse every completed stage A/B/C directory on the server for a code change
+        that altered no science. A swept config still hashes apart from an unswept one, which
+        is the property the guard actually needs.
+
+        Deliberately narrow rather than `exclude_defaults=True`: that would drop every
+        defaulted field at once and move all the existing hashes it is here to preserve.
         """
-        payload = json.dumps(self.model_dump(mode="json", exclude={"runtime"}), sort_keys=True)
-        return hashlib.sha256(payload.encode()).hexdigest()[:_HASH_LENGTH]
+        payload = self.model_dump(mode="json", exclude={"runtime"})
+        estimate = payload["estimate"]
+        for axis in ("sweep_methods", "sweep_thresholds_px"):
+            if not estimate[axis]:
+                del estimate[axis]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[
+            :_HASH_LENGTH
+        ]
 
     def snapshot(self, run_dir: Path | str) -> Path:
         """Write the fully-resolved config (``runtime`` included) into the run directory.

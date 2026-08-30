@@ -50,6 +50,21 @@ between a benchmark that runs overnight and one that does not.
 Failures are rows. A pair the matcher cannot solve is recorded with ``success=False`` and a
 reason, never dropped (TASKS.md X-4) -- a benchmark that silently discards its hard cases
 reports the score of an easier dataset than the one it claims.
+
+**Estimation is swept inside the pair loop** (TASKS.md P3-10). ``config.estimate.variants()``
+resolves to one cell normally and to the P3-10 cross-product when the sweep fields are set;
+either way this module matches *once* per (pair, matcher) and estimates once per variant off
+the one ``MatchResult``. The estimator axis is downstream of the matcher, so twelve variants
+cost twelve ``cv2.findHomography`` calls rather than twelve match passes -- ~4-5 h against the
+~38 h `experiments/GRID.md` §6 originally froze.
+
+That equivalence rests on one measured property: **OpenCV's robust estimators are
+deterministic and carry no RNG state between calls.** Repeated fits on identical input are
+bit-identical and ``cv2.setRNGSeed`` does not move them (opencv 5.0.0), so variant *k*'s result
+does not depend on variants 1..k-1 having run, and a swept row equals the row a single-estimator
+run would have produced. It is pinned by ``tests/test_estimate.py`` so a different OpenCV build
+fails loudly rather than silently making the sweep order-dependent, and by
+``tests/test_runner.py``, which scores a swept run against single-estimator runs row for row.
 """
 
 from __future__ import annotations
@@ -62,7 +77,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cmreg.config import Config, Modality
+from cmreg.config import Config, EstimateConfig, Estimator, Modality
 from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
 from cmreg.estimate import Estimate, EstimateError, estimate_homography
@@ -167,23 +182,43 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
             config.gt.moving.value,
         )
 
+    # Resolved once. One cell for an ordinary config; the P3-10 cross-product when the sweep
+    # fields are set. Every pair produces a row per (matcher, variant), so a swept directory
+    # holds twelve equally-sized populations rather than one pooled one.
+    variants = config.estimate.variants()
+    if config.estimate.is_sweeping:
+        logger.info(
+            "sweeping %d estimation variants off each match (P3-10): %s",
+            len(variants),
+            ", ".join(variant.label for variant in variants),
+        )
+
     rows: list[PairRow] = []
     identity = _identity_columns(config, manifest, calibration)
+    # (matcher, estimator) pairs already reported as unsupported, so a capability gap costs one
+    # log line rather than one per pair. See `_evaluate`.
+    reported: set[tuple[str, str]] = set()
     for position, (index, optical_path) in enumerate(selected):
         pair = _load_pair(optical_path, manifest, config, index, calibration)
         if pair is None:
             rows.extend(
-                _failed_row(optical_path.stem, name, identity, "unreadable_pair")
+                _failed_row(optical_path.stem, name, variant, identity, "unreadable_pair")
                 for name in matchers
+                for variant in variants
             )
             continue
         for name, matcher in matchers.items():
             try:
-                rows.append(_evaluate(pair, index, name, matcher, config, identity))
+                rows.extend(
+                    _evaluate(pair, index, name, matcher, config, variants, identity, reported)
+                )
             except EstimateError:
-                # The one class of error that is about the *config*, not the pair -- PROSAC
-                # without confidences fails identically on all 300 pairs, so aborting says so
-                # once instead of writing 6000 rows that all blame the data.
+                # The one class of error that is about the *config*, not the pair -- a
+                # correspondence-count mismatch fails identically on all 300 pairs, so aborting
+                # says so once instead of writing 6000 rows that all blame the data. An
+                # estimator the *matcher* cannot support is not this: it is a capability gap,
+                # it is per (matcher, estimator) rather than per config, and `_evaluate` records
+                # it as rows so the other eleven variants still produce theirs.
                 raise
             except Exception:
                 # A matcher raising is a property of that (pair, matcher), and the run's rows
@@ -192,7 +227,10 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
                 logger.exception(
                     "%s on %s raised; recording the cell as a failure", name, pair.stem
                 )
-                rows.append(_failed_row(pair.stem, name, identity, "matcher_raised", pair.shape))
+                rows.extend(
+                    _failed_row(pair.stem, name, variant, identity, "matcher_raised", pair.shape)
+                    for variant in variants
+                )
         if (position + 1) % 50 == 0:
             logger.info("  %d / %d pairs", position + 1, len(selected))
 
@@ -200,12 +238,30 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
     config.snapshot(run_dir)
     write_rows(rows, run_dir)
 
+    # Matchers-outer, variants-inner: the order the loop above produced them in, which is the
+    # order the console blocks print in and the order a re-render by `cmreg report` reproduces.
+    cells = [(name, variant) for name in matchers for variant in variants]
     summaries = tuple(
-        summarize([row for row in rows if row.matcher == name], config.eval.thresholds_px)
-        for name in matchers
+        summarize(_rows_for(rows, name, variant), config.eval.thresholds_px)
+        for name, variant in cells
     )
-    _publish(config, summaries)
+    _publish(config, [variant for _, variant in cells], summaries)
     return summaries
+
+
+def _rows_for(rows: Sequence[PairRow], matcher: str, variant: EstimateConfig) -> list[PairRow]:
+    """The rows of one (matcher, estimation variant) cell.
+
+    Filtered on the two *columns* rather than on position, so this is the same grouping
+    `cmreg report` applies when it re-renders the file with no config in hand.
+    """
+    return [
+        row
+        for row in rows
+        if row.matcher == matcher
+        and row.estimator == variant.method.value
+        and row.threshold_px == variant.threshold_px
+    ]
 
 
 def _load_calibration(config: Config, dataset: str) -> ResidualCalibration | None:
@@ -259,8 +315,9 @@ def _identity_columns(
         "preprocess_mov": config.preprocess.moving.value,
         "upsample": config.preprocess.moving_upsample,
         "interpolation": config.preprocess.moving_interpolation.value,
-        "estimator": config.estimate.method.value,
-        "threshold_px": config.estimate.threshold_px,
+        # `estimator` and `threshold_px` are deliberately absent: P3-10 sweeps them *within* a
+        # run, so they are per-row rather than constant. `_row` and `_failed_row` set them from
+        # the variant that produced the row.
         "warp": WARP_MODEL,
         "moving": config.gt.moving.value,
         "reference": config.gt.reference_modality.value,
@@ -345,9 +402,16 @@ def _load_pair(
 
 
 def _evaluate(
-    pair: _Pair, index: int, name: str, matcher, config: Config, identity: dict[str, object]
-) -> PairRow:
-    """Match, estimate and score one (pair, matcher) cell."""
+    pair: _Pair,
+    index: int,
+    name: str,
+    matcher,
+    config: Config,
+    variants: Sequence[EstimateConfig],
+    identity: dict[str, object],
+    reported: set[tuple[str, str]],
+) -> list[PairRow]:
+    """Match once, then estimate and score one row per estimation variant."""
     # Before the matcher, not before the run: see `seeding.py::seed_cell`. Dense matchers
     # sample their correspondences stochastically, and an ambient RNG makes a cell's result
     # depend on which other matchers happened to share its config.
@@ -357,21 +421,76 @@ def _evaluate(
 
     # Back to native pixels before estimation, so every metric is in reference-image units
     # whatever the upsampling factor was (preprocess/variants.py explains the half-pixel term).
+    # Hoisted out of the variant loop with the match itself: nothing here depends on the
+    # estimator, and repeating it would charge the sweep for work it does not do.
     kpts_reference = result.kpts0
     kpts_moving = moving.to_native(result.kpts1)
 
-    start = time.perf_counter()
-    # src is the warped moving image, dst is the reference: the estimate must map the moving
-    # image back into the reference frame, which is the direction `truth` describes.
-    estimate = estimate_homography(kpts_moving, kpts_reference, config.estimate, result.confidence)
-    estimate_ms = (time.perf_counter() - start) * 1e3
+    rows: list[PairRow] = []
+    for variant in variants:
+        if variant.method is Estimator.PROSAC and result.confidence is None:
+            rows.append(_unsupported_row(pair, name, variant, identity, result, reported))
+            continue
+        start = time.perf_counter()
+        # src is the warped moving image, dst is the reference: the estimate must map the
+        # moving image back into the reference frame, which is the direction `truth` describes.
+        estimate = estimate_homography(kpts_moving, kpts_reference, variant, result.confidence)
+        estimate_ms = (time.perf_counter() - start) * 1e3
+        rows.append(_row(pair, name, variant, identity, result, estimate, estimate_ms))
+    return rows
 
-    return _row(pair, name, identity, result, estimate, estimate_ms)
+
+def _unsupported_row(
+    pair: _Pair,
+    matcher: str,
+    variant: EstimateConfig,
+    identity: dict[str, object],
+    result: MatchResult,
+    reported: set[tuple[str, str]],
+) -> PairRow:
+    """A row for a variant this matcher cannot support, warned about once.
+
+    PROSAC draws its minimal samples in descending confidence order, and three of ``vismatch``'s
+    backends return no confidence at all -- ``xfeat`` among them, which is in `experiments/GRID.md`
+    §6's `reduced-8` (TASKS.md P0-2). `estimate/robust.py` raises for that rather than degrading
+    silently to RANSAC, and for a single-estimator run raising is right: it fails identically on
+    every pair. Inside a sweep it is not, because it would discard eleven variants that ran fine
+    *after* the matching has been paid for.
+
+    So it is a row, with a reason naming the cause exactly -- which is what X-4 asks for and what
+    the fatal path's "6000 rows that all blame the data" objection was actually about. The
+    warning fires once per (matcher, estimator), not 300 times into a console that reaches the
+    Mac by copy-paste.
+    """
+    key = (matcher, variant.method.value)
+    if key not in reported:
+        reported.add(key)
+        logger.warning(
+            "%s returns no per-match confidence, so %s cannot run against it; recording every "
+            "pair of that cell as 'estimator_needs_confidence' (TASKS.md P0-2)",
+            matcher,
+            variant.method.value,
+        )
+    # Built through `_row` from a failed `Estimate` rather than through `_failed_row`, because
+    # the *matching* really happened: this cell has honest match counts and honest timings, and
+    # only the estimate is absent. `_failed_row` would zero all of them and make the matcher
+    # read as having found nothing, which is the distinction `n_matches` exists to carry.
+    unsupported = Estimate(
+        h=None,
+        inlier_mask=np.zeros(len(result), dtype=bool),
+        n_matches=len(result),
+        n_inliers=0,
+        inlier_ratio=0.0,
+        reproj_err=float("nan"),
+        failure_reason="estimator_needs_confidence",
+    )
+    return _row(pair, matcher, variant, identity, result, unsupported, estimate_ms=0.0)
 
 
 def _row(
     pair: _Pair,
     matcher: str,
+    variant: EstimateConfig,
     identity: dict[str, object],
     result: MatchResult,
     estimate: Estimate,
@@ -401,6 +520,9 @@ def _row(
         height=pair.shape[0],
         width=pair.shape[1],
         matcher=matcher,
+        # Per row, not per run: P3-10 sweeps these two within a single run directory.
+        estimator=variant.method.value,
+        threshold_px=variant.threshold_px,
         success=estimate.h is not None,
         failure_reason=failure_reason,
         overlap=pair.overlap,
@@ -429,17 +551,24 @@ def _row(
 def _failed_row(
     stem: str,
     matcher: str,
+    variant: EstimateConfig,
     identity: dict[str, object],
     reason: str,
     shape: tuple[int, int] | None = None,
 ) -> PairRow:
-    """A row for a cell that produced no estimate, because the pair or the matcher failed."""
+    """A row for a cell that produced no estimate, because the pair or the matcher failed.
+
+    Emitted once per estimation variant, so every (matcher, variant) population in a swept
+    directory has the same pair count and `reg/n_pairs` means the same thing in all of them.
+    """
     return PairRow(
         stem=stem,
         # Null when the pair could not be decoded, so there is no shape to report.
         height=None if shape is None else shape[0],
         width=None if shape is None else shape[1],
         matcher=matcher,
+        estimator=variant.method.value,
+        threshold_px=variant.threshold_px,
         success=False,
         failure_reason=reason,
         overlap=float("nan"),
@@ -461,15 +590,20 @@ def _failed_row(
     )
 
 
-def _variant_label(config: Config) -> str:
+def _variant_label(config: Config, variant: EstimateConfig) -> str:
     """The preprocessing/estimation recipe, as the one token that names a cell in W&B.
 
-    The interpolation kernel appears **only above x1**. At x1 `preprocess.upsample` returns the
-    input untouched, so the kernel is genuinely inert there and omitting it hides nothing --
+    **An axis appears here only where it is varied**, which is the rule the interpolation
+    kernel established and the P3-10 threshold now follows. At x1 `preprocess.upsample` returns
+    the input untouched, so the kernel is genuinely inert there and omitting it hides nothing --
     while including it unconditionally would rename every stage-A and stage-B run, which are all
     x1, and a W&B project whose run names drift between stages is one nobody can read across
     them. Above x1 it is load-bearing: stage C (P3-9) varies the kernel at a fixed factor, and
     without it four cells would collide into one run name (X-2).
+
+    The estimator threshold is the same shape of decision. It is constant in stages A-C, so
+    including it unconditionally would rename all of them; stage D (P3-10) sweeps it, and
+    without it the three thresholds of one estimator would collide into one run name.
     """
     label = (
         f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
@@ -477,44 +611,84 @@ def _variant_label(config: Config) -> str:
     )
     if config.preprocess.moving_upsample > 1:
         label += f"-{config.preprocess.moving_interpolation.value}"
-    return f"{label}-{config.estimate.method.value}"
+    label += f"-{variant.method.value}"
+    if config.estimate.sweep_thresholds_px:
+        label += f"@{variant.threshold_px:g}px"
+    return label
 
 
-def _publish(config: Config, summaries: Sequence[Summary]) -> None:
-    """Send each summary to W&B and print its console block.
+def _publish(
+    config: Config, variants: Sequence[EstimateConfig], summaries: Sequence[Summary]
+) -> None:
+    """Send every summary to W&B, and print the anchor variant's console blocks.
 
-    One W&B run per matcher, named to TASKS.md §0's frozen format. ``runtime.name`` names the
-    local run directory; the W&B name is *derived*, because a campaign that overrides the
-    matcher on the command line would otherwise file every cell under one name.
+    One W&B run per (matcher, estimation variant), named to TASKS.md §0's frozen format.
+    ``runtime.name`` names the local run directory; the W&B name is *derived*, because a
+    campaign that overrides the matcher on the command line would otherwise file every cell
+    under one name.
+
+    **Everything is logged; only the anchor is printed.** X-1 wants every experiment in W&B, so
+    all twelve of a stage-D cell's variants get a run. The console is the other channel and it
+    has a different constraint: it reaches the Mac by copy-paste, and ninety-six blocks per cell
+    is a paste nobody can read. The anchor -- the config's own scalar `(method, threshold_px)`,
+    which `EstimateConfig` guarantees is one of the swept cells -- prints exactly the blocks an
+    unswept run prints, so a non-sweep run's output is unchanged and a stage driver renders the
+    sweep's own tables from Parquet (`scripts/p3d_estimator.py`), as stage C does.
     """
-    variant = _variant_label(config)
-    for summary in summaries:
+    anchor = config.estimate.method, config.estimate.threshold_px
+    printed: list[Summary] = []
+    for variant, summary in zip(variants, summaries, strict=True):
         matcher = summary.context["matcher"]
+        label = _variant_label(config, variant)
+        name = run_name("p3", matcher, config.data.manifest.parent.name, label, config.gt.seed)
         cell = config.model_copy(
             update={
                 "runtime": config.runtime.model_copy(
-                    update={
-                        "name": run_name(
-                            "p3",
-                            matcher,
-                            config.data.manifest.parent.name,
-                            variant,
-                            config.gt.seed,
-                        )
-                    }
+                    update={"name": name, "group": _group(config, matcher, label)}
                 )
             }
         )
         tags = run_tags(
             cell,
             matcher=matcher,
-            preprocess=variant,
-            estimator=config.estimate.method.value,
+            preprocess=label,
+            estimator=variant.method.value,
             warp=WARP_MODEL,
         )
-        with RunTracker(cell, tags) as tracker:
+        # The config passed to W&B is the run's own, *unmodified*, so `config_hash` there equals
+        # the one stamped on this cell's Parquet rows and the two stores join. Which of the
+        # sweep's cells this run is therefore cannot come from the config, and is logged beside
+        # it instead -- the run name says it too, but a name is not a filterable field.
+        with RunTracker(
+            cell,
+            tags,
+            extra_config={
+                "cell/estimator": variant.method.value,
+                "cell/threshold_px": variant.threshold_px,
+            },
+        ) as tracker:
             tracker.log(summary.metrics)
-        print(render(summary))
+        if (variant.method, variant.threshold_px) == anchor:
+            printed.append(summary)
 
-    if len(summaries) > 1:
-        print(render_comparison(summaries, COMPARISON_KEYS))
+    for summary in printed:
+        print(render(summary))
+    if len(printed) > 1:
+        print(render_comparison(printed, COMPARISON_KEYS))
+
+
+def _group(config: Config, matcher: str, label: str) -> str:
+    """The W&B group for one cell: the run name with the seed dropped.
+
+    Ungrouped runs do not aggregate, and TASKS.md §0 uses `group=` for exactly this -- a
+    factorial cell whose seeds W&B should average. Stage D is the first stage with more than
+    one seed, and its five land in one group precisely because `seed` is the one thing this
+    string omits. Derived rather than passed, for the same reason the run name is: the driver
+    supplies one `--group` per dataset and cannot know the twelve variants inside it.
+
+    An unswept run keeps the configured group untouched, so stages A-C are unaffected.
+    """
+    if not config.estimate.is_sweeping:
+        return config.runtime.group
+    base = config.runtime.group or f"p3_{config.data.manifest.parent.name}"
+    return f"{base}_{matcher}_{label}"

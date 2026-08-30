@@ -6,8 +6,17 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
-from cmreg.config import Config, ConfigError, Domain, Platform, deep_merge
+from cmreg.config import (
+    Config,
+    ConfigError,
+    Domain,
+    EstimateConfig,
+    Estimator,
+    Platform,
+    deep_merge,
+)
 
 
 def _write(tmp_path: Path, data: dict) -> Path:
@@ -135,3 +144,78 @@ def test_the_residual_calibration_defaults_to_none() -> None:
     """Tier-1 as originally specified. Composition is opt-in per dataset (GRID.md §3): `msrs`
     and `dronevehicle` must never compose, so the default cannot be "whatever file is there"."""
     assert Config.model_validate({}).gt.residual_calibration is None
+
+
+def test_an_unswept_config_resolves_to_itself() -> None:
+    """Every config written before P3-10 still describes exactly one estimation cell, and the
+    runner's variant loop is therefore uniform rather than conditional."""
+    config = EstimateConfig()
+    assert not config.is_sweeping
+    assert config.variants() == (config,)
+
+
+def test_the_sweep_is_the_cross_product_of_the_two_axes() -> None:
+    config = EstimateConfig(
+        sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS), sweep_thresholds_px=(1.0, 3.0, 5.0)
+    )
+    assert [variant.label for variant in config.variants()] == [
+        "magsac@1px",
+        "magsac@3px",
+        "magsac@5px",
+        "lmeds@1px",
+        "lmeds@3px",
+        "lmeds@5px",
+    ]
+
+
+def test_the_axes_sweep_independently() -> None:
+    """`sweep_methods` alone is four cells, not twelve: the unswept axis falls back to its
+    scalar rather than being treated as empty."""
+    methods_only = EstimateConfig(sweep_methods=(Estimator.MAGSAC, Estimator.RANSAC))
+    assert [v.threshold_px for v in methods_only.variants()] == [3.0, 3.0]
+    thresholds_only = EstimateConfig(sweep_thresholds_px=(3.0, 5.0))
+    assert [v.method for v in thresholds_only.variants()] == [Estimator.MAGSAC] * 2
+
+
+def test_a_variant_is_the_config_a_single_cell_run_would_have_used() -> None:
+    """Variants carry empty sweep lists, which is what makes "a swept row equals a single-run
+    row" a statement about the config layer and not only about the runner."""
+    swept = EstimateConfig(
+        sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS), sweep_thresholds_px=(1.0, 3.0)
+    )
+    for variant in swept.variants():
+        assert not variant.is_sweeping
+        assert variant == EstimateConfig(method=variant.method, threshold_px=variant.threshold_px)
+
+
+def test_the_anchor_must_be_one_of_the_swept_cells() -> None:
+    """Otherwise the scalars are dead weight that still enter `config_hash`, and the block the
+    runner prints would belong to no table (`eval/runner.py::_publish`)."""
+    with pytest.raises(ValidationError):
+        EstimateConfig(method=Estimator.RANSAC, sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS))
+    with pytest.raises(ValidationError):
+        EstimateConfig(threshold_px=7.0, sweep_thresholds_px=(1.0, 3.0))
+
+
+def test_swept_thresholds_must_be_ascending_and_unique() -> None:
+    """The swept values become the columns of a table that reaches a human by copy-paste."""
+    with pytest.raises(ValidationError):
+        EstimateConfig(threshold_px=1.0, sweep_thresholds_px=(5.0, 3.0, 1.0))
+    with pytest.raises(ValidationError):
+        EstimateConfig(sweep_thresholds_px=(3.0, 3.0))
+
+
+def test_an_empty_sweep_leaves_config_hash_where_it_was() -> None:
+    """X-5, and the resume guard in particular.
+
+    Two defaulted fields would otherwise move every hash in the project, and
+    `scripts/stages.py::refuse_a_stale_run` -- whose job is to refuse a directory scored under
+    a *different experiment* -- would refuse every completed stage A/B/C directory for a code
+    change that altered no science. The literal is the pre-P3-10 hash of the default config.
+    """
+    assert Config().config_hash() == "04f02efbd8b566ed"
+
+
+def test_a_sweep_is_a_different_experiment() -> None:
+    swept = Config(estimate=EstimateConfig(sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS)))
+    assert swept.config_hash() != Config().config_hash()

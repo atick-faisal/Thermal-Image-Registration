@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cmreg.metrics.schema import MACE, N_PAIRS, success_rate_key
-from p3a_grid import CELLS, CONFIG, Cell, DryRun, run_cell
+from stages import CELLS, CONFIG, Cell, DryRun, run_cell
 
 # Read beside `reg/mace`, never instead of it: P3-7's F7/F13 established that a thresholded
 # rate is a function of the dataset's residual floor and a mean over corner errors is not, and
@@ -119,7 +119,7 @@ def run(cell: Cell, polarity: Polarity, device: str, dry: DryRun) -> bool:
         "--run-dir",
         str(run_dir),
     ]
-    # The `R` policy is per dataset and is carried from `p3a_grid.CELLS` rather than restated:
+    # The `R` policy is per dataset and is carried from `stages.CELLS` rather than restated:
     # `flir` composes and the other three do not (GRID.md §3), and a polarity axis does not
     # touch that decision.
     if cell.calibration is not None:

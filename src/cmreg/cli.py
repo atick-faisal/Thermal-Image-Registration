@@ -55,6 +55,8 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "matchers": ("match", "matchers"),
     "estimator": ("estimate", "method"),
     "threshold": ("estimate", "threshold_px"),
+    "sweep_estimators": ("estimate", "sweep_methods"),
+    "sweep_thresholds": ("estimate", "sweep_thresholds_px"),
     "preprocess_ref": ("preprocess", "reference"),
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
@@ -130,6 +132,23 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--estimator", choices=[e.value for e in Estimator])
     parser.add_argument("--threshold", type=float, help="estimator inlier threshold in pixels")
+    # P3-10's axis. Swept *inside* the pair loop -- the estimator is downstream of the matcher,
+    # so twelve variants cost twelve `cv2.findHomography` calls off one `MatchResult` rather
+    # than twelve match passes. `--estimator`/`--threshold` still name the anchor, which
+    # `EstimateConfig` requires to be one of the swept cells: it is the variant whose console
+    # block is printed, and a run whose printed block belonged to no table would be unreadable.
+    parser.add_argument(
+        "--sweep-estimators",
+        dest="sweep_estimators",
+        type=_comma_separated,
+        help="comma-separated estimators to sweep, e.g. 'magsac,ransac,lmeds,prosac' (P3-10)",
+    )
+    parser.add_argument(
+        "--sweep-thresholds",
+        dest="sweep_thresholds",
+        type=_comma_separated_floats,
+        help="comma-separated inlier thresholds in px to sweep, ascending, e.g. '1,3,5'",
+    )
     parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
     parser.add_argument("--preprocess-mov", dest="preprocess_mov", choices=_VARIANTS)
     parser.add_argument("--upsample", type=int, help="thermal upsampling factor (1-8)")
@@ -155,6 +174,18 @@ def _comma_separated(value: str) -> tuple[str, ...]:
     single token is far easier to build there than a repeated flag.
     """
     return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _comma_separated_floats(value: str) -> tuple[float, ...]:
+    """``--sweep-thresholds 1,3,5`` -> ``(1.0, 3.0, 5.0)``.
+
+    Parsed here rather than left to pydantic so a typo names the flag and the offending token,
+    not a nested config path a caller never wrote.
+    """
+    try:
+        return tuple(float(item) for item in _comma_separated(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r}: expected comma-separated numbers") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -342,13 +373,21 @@ def _run_report(args: argparse.Namespace) -> int:
     from cmreg.results import read_rows, render, render_comparison, summarize
 
     rows = read_rows(args.run_dir)
-    # Preserve first-appearance order rather than sorting: it is the order the run produced
-    # them in, which is the order the original block was printed in, so a re-render is
-    # diffable against a pasted one.
-    names = list(dict.fromkeys(row.matcher for row in rows))
+    # Grouped by (matcher, estimator, threshold), not by matcher alone: P3-10 sweeps the
+    # estimator *inside* one run directory, and grouping on the matcher would pool twelve
+    # estimators into a single summary that describes none of them. Identical for every
+    # unswept directory, where each matcher has exactly one estimation cell.
+    #
+    # First-appearance order rather than sorted: it is the order the run produced them in,
+    # which is the order the original block was printed in, so a re-render is diffable against
+    # a pasted one.
+    cells = list(dict.fromkeys((row.matcher, row.estimator, row.threshold_px) for row in rows))
     summaries = [
-        summarize([row for row in rows if row.matcher == name], tuple(args.thresholds))
-        for name in names
+        summarize(
+            [row for row in rows if (row.matcher, row.estimator, row.threshold_px) == cell],
+            tuple(args.thresholds),
+        )
+        for cell in cells
     ]
     for summary in summaries:
         print(render(summary))

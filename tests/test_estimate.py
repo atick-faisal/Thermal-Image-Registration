@@ -147,3 +147,44 @@ def test_confidence_reaches_the_solver() -> None:
 
     with pytest.raises((ValueError, ConfigError)):
         EstimateConfig(confidence=1.5)
+
+
+@pytest.mark.parametrize("method", ESTIMATORS)
+def test_repeated_fits_on_one_input_are_bit_identical(
+    method: Estimator, contaminated: tuple[np.ndarray, np.ndarray, np.ndarray]
+) -> None:
+    """The property P3-10's whole cost model rests on.
+
+    Stage D sweeps twelve estimator variants off a *single* ``MatchResult`` -- 10 match passes
+    rather than 120 -- on the claim that this is the same experiment as twelve separate runs.
+    That is only true if a fit carries no RNG state to the next one. Measured on opencv 5.0.0,
+    where the robust solvers are deterministic and ``cv2.setRNGSeed`` does not move them; pinned
+    here so a different build on the training server fails loudly instead of silently making
+    every swept table order-dependent.
+
+    ``tests/test_runner.py::test_a_swept_run_reproduces_single_estimator_runs_row_for_row`` is
+    the same claim at the level of the runner; this is the one that names the cause.
+    """
+    source, target, confidence = contaminated
+    config = EstimateConfig(method=method)
+    first = estimate_homography(source, target, config, confidence).h
+    assert first is not None
+    for _ in range(3):
+        again = estimate_homography(source, target, config, confidence).h
+        assert again is not None
+        assert np.array_equal(again, first)
+
+
+@pytest.mark.parametrize("method", ESTIMATORS)
+def test_a_fit_does_not_depend_on_what_was_fitted_before_it(
+    method: Estimator, contaminated: tuple[np.ndarray, np.ndarray, np.ndarray]
+) -> None:
+    """The sweep runs the four estimators back to back off one match; interleaving them must
+    not change any of their answers. The test above pins repetition, this pins *order*."""
+    source, target, confidence = contaminated
+    alone = estimate_homography(source, target, EstimateConfig(method=method), confidence)
+    for other in ESTIMATORS:
+        estimate_homography(source, target, EstimateConfig(method=other), confidence)
+    after = estimate_homography(source, target, EstimateConfig(method=method), confidence)
+    assert alone.h is not None and after.h is not None
+    assert np.array_equal(after.h, alone.h)

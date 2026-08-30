@@ -143,13 +143,31 @@ per-dataset row's confidence interval depend on the dataset for a reason no read
 
 ## 5. Seeds
 
-One seed everywhere except stage D. X-3 asks for >=5 seeds with CIs on anything stochastic;
-the cost of honouring that on every stage is 5x the whole grid. What is actually stochastic
-here is **RANSAC's sampling and the dense matchers' correspondence sampling**, and `seed_cell`
-already pins both per `(seed, pair, matcher)` (P0-9). Stage D varies the estimator, so it is
-where seed-to-seed variance is the measurement rather than a nuisance, and it carries 5 seeds.
-Any *claim* of the form "A beats B" gets its 5 seeds before it enters the paper (P8-2's
-Wilcoxon needs them); a scoping row does not.
+One seed everywhere except stage D, which carries five. X-3 asks for >=5 seeds with CIs on
+anything stochastic; the cost of honouring that on every stage is 5x the whole grid.
+
+**The reason this section gave until 2026-08-30 was wrong, and is recorded rather than quietly
+replaced.** It read: *"what is actually stochastic here is RANSAC's sampling and the dense
+matchers' correspondence sampling ... stage D varies the estimator, so it is where seed-to-seed
+variance is the measurement rather than a nuisance."* Measured while authoring P3-10:
+**OpenCV's robust estimators are deterministic.** Repeated `cv2.findHomography` fits on
+identical input are bit-identical under MAGSAC, RANSAC, LMEDS and PROSAC, and `cv2.setRNGSeed`
+does not move them (opencv 5.0.0). RANSAC's sampling contributes exactly zero variance to
+anything in this grid, and the one axis whose seeds were justified by it is the estimator axis.
+
+The two terms that *are* stochastic are the **synthetic warp draw** (`gt.seed`) and the
+**matcher's own correspondence sampling** (`seed_cell`, pinned per `(seed, pair, matcher)`,
+P0-9). Stage D's five seeds measure those, which is still the interval X-3 asks for and still
+what P8-2's Wilcoxon needs, so the budget does not change -- only the sentence justifying it.
+Any *claim* of the form "A beats B" gets its five seeds before it enters the paper; a scoping
+row does not.
+
+That same determinism is what makes stage D affordable at all (§6): twelve estimator variants
+taken off one `MatchResult` are order-independent, and therefore the same experiment as twelve
+separate runs. `tests/test_estimate.py` pins the cause and
+`tests/test_runner.py::test_a_swept_run_reproduces_single_estimator_runs_row_for_row` pins the
+consequence, because nothing else in the suite would notice if it stopped holding: every swept
+table would look entirely plausible and every number in it would be wrong.
 
 ## 6. The stages
 
@@ -300,6 +318,62 @@ rather than resolution. The precondition: `PreprocessConfig` has no reference-si
 because `preprocess_reference` deliberately never resizes — P3-12 has to add one, or express the
 sweep as a decode-time resize of the pair before the frame is fixed.
 
+### Stage D's twelve variants, and why they cost ten match passes
+
+`scripts/p3d_estimator.py`, driving `p3a_baseline_grid.yaml` with `--sweep-estimators` /
+`--sweep-thresholds` per cell. The naive reading of the table row above is 24 cells x 5 seeds =
+**120 `cmreg bench` invocations**, which at stage C's measured ~19 min per reduced-8 cell is
+~38 h. Almost all of that is waste.
+
+**The estimator axis is downstream of the matcher.** `eval/runner.py::_evaluate` matches once
+and then calls `estimate_homography`; `config.estimate` is the only thing this stage varies. The
+frozen grid re-runs RoMa twelve times per pair to change a RANSAC threshold. So the runner
+sweeps *inside* the pair loop instead: `EstimateConfig.variants()` resolves the cross-product,
+and one match pass feeds twelve `cv2.findHomography` calls. The stage is **10 match passes** --
+2 datasets x 5 seeds, and the seeds genuinely do need re-matching, since `gt.seed` draws the
+warp and `seed_cell` seeds the matcher's sampling -- at **~4-5 h**.
+
+`PairRow` already carried `estimator` and `threshold_px` as columns (P3-2), so the results store
+needed nothing: a swept directory holds twelve equally-sized populations, distinguished
+natively, and `cmreg report` groups on those columns rather than on the matcher alone.
+
+Three decisions it settles, each of which could have gone the other way:
+
+- **One config, one hash, one snapshot per run directory.** The twelve variants share the
+  sweep's `config_hash`. Stamping each row with the hash of the single-variant config that would
+  have produced it was rejected: `config.snapshot()` writes exactly one `config.yaml`, and a
+  hash matching no file on disk destroys the correspondence that makes a run traceable (X-2).
+  `stages.py::refuse_a_stale_run` therefore needs no change and gets *stronger* -- changing a
+  swept value changes the hash, so resuming onto a directory scored under a different sweep is
+  refused. `Config.config_hash` keeps an **empty** sweep out of its payload for the converse
+  reason: without that, adding two defaulted fields would have moved every hash in the project
+  and made the guard refuse every completed stage A-C directory for a change that altered no
+  science.
+- **The sweep is two additive lists beside the anchor, not a list of whole configs** -- P3-1's
+  rule, that a stage's diff from the anchor is exactly the fields it varies. The anchor
+  `(method, threshold_px)` must be one of the swept cells, enforced in `EstimateConfig`: it is
+  the variant whose console block the runner prints, and a printed block belonging to no column
+  of the stage's tables would be unreadable.
+- **`xfeat` cannot run PROSAC**, and that is a row rather than an abort. PROSAC orders its
+  minimal samples by confidence, and `xfeat` is one of three vismatch backends returning none
+  (P0-2) -- and it is in reduced-8. `estimate/robust.py` still raises for a single-estimator
+  run, where failing identically on all 300 pairs is worth saying once; inside a sweep the
+  runner records `estimator_needs_confidence` instead, because aborting there discards eleven
+  variants *after* the matching they depend on has been paid for. Named in every table it
+  touches, out of the rows themselves rather than a hardcoded list (X-4).
+
+**LMEDS is the stage's free falsification, and authoring it corrected an inherited belief.**
+This repo asserted in two places that LMEDS "ignores `threshold_px` entirely" and that its
+threshold row is "flat by construction". Half true: LMEDS minimises the *median* residual, so
+the threshold never reaches its **fit** and its homography really is identical across 1/3/5 px
+-- but OpenCV thresholds the returned **inlier mask** anyway, so `n_inliers`, `inlier_ratio`,
+`reproj_err` and `estimate/robust.py`'s four-inlier gate all move, and a tight threshold can
+fail a cell whose geometry was fine. The driver's integrity block is therefore asserted on the
+homographies of pairs solved at all three thresholds, not on any success-weighted aggregate: an
+aggregate check would have read the lost pairs as a violation and been wrong. It reads PASS when
+LMEDS is identical and every other estimator is not; every estimator flat would be PLAN.md
+§15A's bug -- a swept knob that never reaches the solver -- in this stage's shape.
+
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
 
@@ -326,7 +400,7 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
 | C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
-| D | reduced-8, ~36,000 | **~4–5 h projected**, not the ~38 h the frozen 120 invocations imply: the estimator axis is downstream of the matcher, so the stage is **10 match passes** (2 datasets × 5 seeds) feeding twelve estimator calls each. See §6 |
+| D | reduced-8, ~36,000 rows × 12 variants | **~4–5 h projected**, not the ~38 h the frozen 120 invocations imply: the estimator axis is downstream of the matcher, so the stage is **10 match passes** (2 datasets × 5 seeds) feeding twelve estimator calls each. See §6. The twelve variants add `time/estimate_ms` and nothing else — read the stage's bill off that column, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget

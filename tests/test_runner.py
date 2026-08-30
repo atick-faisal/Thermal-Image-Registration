@@ -88,7 +88,47 @@ def test_the_interpolation_kernel_names_a_cell_only_where_it_acts(
         tmp_path / f"run{factor}",
         preprocess={"moving_upsample": factor, "moving_interpolation": "lanczos"},
     )
-    assert _variant_label(config) == expected
+    assert _variant_label(config, config.estimate) == expected
+
+
+def test_the_threshold_names_a_cell_only_where_it_is_swept(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The same rule as the kernel above, for P3-10's second axis.
+
+    Stages A-C hold the threshold fixed, so naming it there would rename every run already on
+    the server. Stage D sweeps it, and without it the three thresholds of one estimator would
+    collide into a single W&B run name (X-2).
+    """
+    unswept = base_config(aligned_dataset / "data.yaml", tmp_path / "unswept")
+    assert _variant_label(unswept, unswept.estimate) == "none-none-x1-magsac"
+
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept",
+        estimate={"sweep_methods": ["magsac", "lmeds"], "sweep_thresholds_px": [1.0, 3.0]},
+    )
+    assert [_variant_label(swept, v) for v in swept.estimate.variants()] == [
+        "none-none-x1-magsac@1px",
+        "none-none-x1-magsac@3px",
+        "none-none-x1-lmeds@1px",
+        "none-none-x1-lmeds@3px",
+    ]
+
+
+def test_sweeping_only_the_estimator_leaves_the_threshold_out_of_the_name(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """An axis appears in the label only where it is *varied*; the threshold is constant here."""
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "run",
+        estimate={"sweep_methods": ["magsac", "lmeds"]},
+    )
+    assert [_variant_label(config, v) for v in config.estimate.variants()] == [
+        "none-none-x1-magsac",
+        "none-none-x1-lmeds",
+    ]
 
 
 def test_swapping_which_modality_moves_gives_the_same_answer(
@@ -586,6 +626,146 @@ def test_a_subsampled_run_reproduces_the_full_run_row_for_row(
     for row in sampled_rows:
         assert row.stem in reference
         assert row.corner_err == pytest.approx(reference[row.stem])
+
+
+def _register_confidenceless_matcher(name: str) -> None:
+    """A matcher that finds real matches but scores none of them.
+
+    Stands in for ``xfeat``, ``sift-nn`` and ``orb-nn``, the three vismatch backends that
+    return no per-match confidence (TASKS.md P0-2) -- ``xfeat`` being in `experiments/GRID.md`
+    §6's `reduced-8`, so stage D meets this on the server. Delegating to a real matcher rather
+    than fabricating correspondences keeps the other eleven variants' rows meaningful.
+    """
+    from cmreg.matchers import MatchResult, get_matcher, register
+
+    class _NoConfidence:
+        def __init__(self, config, device) -> None:
+            self._inner = get_matcher("sift", config, device)
+
+        @property
+        def name(self) -> str:
+            return name
+
+        def __call__(self, image0, image1):
+            result = self._inner(image0, image1)
+            return MatchResult(
+                kpts0=result.kpts0,
+                kpts1=result.kpts1,
+                confidence=None,
+                n_detected0=result.n_detected0,
+                n_detected1=result.n_detected1,
+                extract_ms=result.extract_ms,
+                match_ms=result.match_ms,
+            )
+
+    register(name, _NoConfidence)
+
+
+SWEPT_METHODS = ("magsac", "ransac", "lmeds", "prosac")
+SWEPT_THRESHOLDS = (1.0, 5.0)
+
+
+def test_a_swept_run_reproduces_single_estimator_runs_row_for_row(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The integrity check for the whole of P3-10, and the reason the stage costs 4-5 h not 38.
+
+    Stage D sweeps the estimator *inside* the pair loop -- one match, many fits -- on the claim
+    that this is the same experiment as running each estimator separately. That claim is only
+    true if OpenCV's solvers carry no state between calls, so variant *k* cannot depend on
+    variants 1..k-1 having run. Nothing else in the suite would notice if they did: every
+    swept table would look entirely plausible and every number in it would be wrong.
+
+    Bit-identical, not approximately equal. An order dependence would show up as a small
+    difference, which is exactly what ``pytest.approx`` would swallow.
+    """
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept",
+        estimate={
+            "sweep_methods": list(SWEPT_METHODS),
+            "sweep_thresholds_px": list(SWEPT_THRESHOLDS),
+            "threshold_px": SWEPT_THRESHOLDS[0],
+        },
+    )
+    run_benchmark(swept)
+    swept_rows = read_rows(tmp_path / "swept")
+
+    for method in SWEPT_METHODS:
+        for threshold in SWEPT_THRESHOLDS:
+            single = base_config(
+                aligned_dataset / "data.yaml",
+                tmp_path / f"single_{method}_{threshold:g}",
+                estimate={"method": method, "threshold_px": threshold},
+            )
+            run_benchmark(single)
+            alone = {row.stem: row for row in read_rows(single.runtime.path)}
+            inside = {
+                row.stem: row
+                for row in swept_rows
+                if row.estimator == method and row.threshold_px == threshold
+            }
+            assert inside.keys() == alone.keys(), f"{method}@{threshold:g}px lost pairs"
+            for stem, row in inside.items():
+                reference = alone[stem]
+                assert row.corner_err == reference.corner_err
+                assert row.h == reference.h
+                assert row.n_inliers == reference.n_inliers
+                assert row.reproj_err == reference.reproj_err
+                assert row.epe_mean == reference.epe_mean
+
+
+def test_every_variant_scores_the_same_pairs(aligned_dataset: Path, tmp_path: Path) -> None:
+    """A swept directory holds N equally-sized populations, not one pooled one.
+
+    `reg/n_pairs` has to mean the same thing in every column of a stage-D table, so a failure
+    -- an unreadable pair, a matcher that raised, an unsupported estimator -- is a row *per
+    variant* rather than one row for the run.
+    """
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "run",
+        estimate={"sweep_methods": ["magsac", "lmeds"], "sweep_thresholds_px": [1.0, 3.0]},
+    )
+    summaries = run_benchmark(config)
+    assert len(summaries) == 4, "one summary per (matcher, estimation variant)"
+    assert len({summary.n_pairs for summary in summaries}) == 1
+    rows = read_rows(tmp_path / "run")
+    cells = {(row.estimator, row.threshold_px) for row in rows}
+    assert cells == {("magsac", 1.0), ("magsac", 3.0), ("lmeds", 1.0), ("lmeds", 3.0)}
+
+
+def test_an_estimator_the_matcher_cannot_support_is_rows_not_an_abort(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """PROSAC needs per-match confidences and three backends supply none (TASKS.md P0-2).
+
+    For a single-estimator run, raising is right -- it fails identically on all 300 pairs. In a
+    sweep it is not: aborting there discards eleven variants that ran fine, *after* the matching
+    they depend on has already been paid for. So it is recorded, with a reason naming the cause,
+    and the match counts stay honest because the matching really did happen.
+    """
+    _register_confidenceless_matcher("_no_confidence")
+    run_dir = tmp_path / "gap"
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        run_dir,
+        match={"matchers": ["_no_confidence"]},
+        estimate={"sweep_methods": ["magsac", "prosac"]},
+    )
+    run_benchmark(config)
+
+    rows = read_rows(run_dir)
+    prosac = [row for row in rows if row.estimator == "prosac"]
+    magsac = [row for row in rows if row.estimator == "magsac"]
+    assert prosac and len(prosac) == len(magsac), "the unsupported cell is still a population"
+    assert all(row.failure_reason == "estimator_needs_confidence" for row in prosac)
+    assert all(not row.success for row in prosac)
+    # The matching happened and cost time; only the estimate is missing. Zeroing these would
+    # read as a matcher that found nothing, which is a different failure entirely.
+    assert all(row.n_matches > 0 for row in prosac)
+    assert [row.n_matches for row in prosac] == [row.n_matches for row in magsac]
+    assert any(row.success for row in magsac), "the supported variant is unaffected"
 
 
 def _register_raising_matcher(name: str) -> None:

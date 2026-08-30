@@ -77,7 +77,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cmreg.metrics.schema import MACE, N_PAIRS, TIME_TOTAL_MS, success_rate_key
-from p3a_grid import CELLS, CONFIG, REDUCED_8, Cell, DryRun, run_cell
+from stages import CELLS, CONFIG, REDUCED_8, Cell, DryRun, run_cell
 
 # `reg/mace` leads, as it does in stages A and B: P3-7's F7/F13 established that a thresholded
 # rate is a function of the dataset's residual floor while a mean over corner errors is not,
@@ -188,7 +188,7 @@ def run(cell: Cell, setting: Setting, device: str, dry: DryRun) -> bool:
         "--run-dir",
         str(run_dir),
     ]
-    # The `R` policy is per dataset and carried from `p3a_grid.CELLS` rather than restated:
+    # The `R` policy is per dataset and carried from `stages.CELLS` rather than restated:
     # `flir` composes, `dronevehicle` does not (GRID.md §3). An upsampling axis does not touch
     # that decision.
     if cell.calibration is not None:

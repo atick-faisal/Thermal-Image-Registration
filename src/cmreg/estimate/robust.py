@@ -116,8 +116,11 @@ def estimate_homography(
         srcPoints=source,
         dstPoints=target,
         method=_METHOD_FLAGS[config.method],
-        # LMEDS ignores this and minimises the median residual instead, which is why an
-        # LMEDS row in the P3-10 threshold sweep is flat by construction rather than by bug.
+        # LMEDS minimises the median residual instead of thresholding, so this never reaches
+        # its solve -- but OpenCV still applies it to the returned `mask`, so it moves
+        # `n_inliers` and can trip the four-inlier gate below on a fit that was perfectly good
+        # (measured on opencv 5.0.0, TASKS.md P3-10). An LMEDS threshold row is flat in `h` and
+        # not in the counts.
         ransacReprojThreshold=config.threshold_px,
         maxIters=config.max_iters,
         confidence=config.confidence,

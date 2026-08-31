@@ -52,11 +52,18 @@ reason, never dropped (TASKS.md X-4) -- a benchmark that silently discards its h
 reports the score of an easier dataset than the one it claims.
 
 **Estimation is swept inside the pair loop** (TASKS.md P3-10). ``config.estimate.variants()``
-resolves to one cell normally and to the P3-10 cross-product when the sweep fields are set;
-either way this module matches *once* per (pair, matcher) and estimates once per variant off
-the one ``MatchResult``. The estimator axis is downstream of the matcher, so twelve variants
-cost twelve ``cv2.findHomography`` calls rather than twelve match passes -- ~4-5 h against the
-~38 h `experiments/GRID.md` §6 originally froze.
+resolves to one cell normally and to a cross-product when the sweep fields are set; either way
+this module matches *once* per (pair, matcher) and estimates once per variant off the one
+``MatchResult``. The estimator axis is downstream of the matcher, so twelve variants cost twelve
+``cv2.findHomography`` calls rather than twelve match passes -- ~4-5 h against the ~38 h
+`experiments/GRID.md` §6 originally froze.
+
+**The warp model is a third axis of that same sweep** (TASKS.md P3-4a) and is swept for the
+identical reason: which transform is fitted to the correspondences is downstream of finding
+them, so stage E costs one match pass per dataset rather than one per model. It differs from the
+estimator axis in one way that shows up in the rows -- not every estimator can fit every model.
+OpenCV's 4-DoF ``estimateAffinePartial2D`` accepts only RANSAC and LMEDS, so a sweep spanning
+both axes has holes, and they are recorded as rows (``_unsupported``) rather than aborted.
 
 That equivalence rests on one measured property: **OpenCV's robust estimators are
 deterministic and carry no RNG state between calls.** Repeated fits on identical input are
@@ -80,7 +87,7 @@ import numpy as np
 from cmreg.config import Config, EstimateConfig, Estimator, Modality
 from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
-from cmreg.estimate import Estimate, EstimateError, estimate_homography
+from cmreg.estimate import UNSUPPORTED_REASON, Estimate, EstimateError, estimate_warp, supports
 from cmreg.gt import (
     DenseGT,
     ResidualCalibration,
@@ -100,10 +107,6 @@ from cmreg.tracking import RunTracker, git_sha, run_name, run_tags
 from cmreg.warp import WarpError, apply_warp
 
 logger = logging.getLogger(__name__)
-
-# The only warp model implemented; a column rather than a constant so P3-4's affine, similarity,
-# TPS and residual-flow entries slot in without a schema migration.
-WARP_MODEL = "homography"
 
 # Metrics shown in the multi-matcher comparison table. The headline three plus one threshold:
 # enough to rank methods at a glance, short enough to stay one line per matcher.
@@ -252,13 +255,14 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
 def _rows_for(rows: Sequence[PairRow], matcher: str, variant: EstimateConfig) -> list[PairRow]:
     """The rows of one (matcher, estimation variant) cell.
 
-    Filtered on the two *columns* rather than on position, so this is the same grouping
+    Filtered on the three *columns* rather than on position, so this is the same grouping
     `cmreg report` applies when it re-renders the file with no config in hand.
     """
     return [
         row
         for row in rows
         if row.matcher == matcher
+        and row.warp == variant.warp_model.value
         and row.estimator == variant.method.value
         and row.threshold_px == variant.threshold_px
     ]
@@ -315,10 +319,9 @@ def _identity_columns(
         "preprocess_mov": config.preprocess.moving.value,
         "upsample": config.preprocess.moving_upsample,
         "interpolation": config.preprocess.moving_interpolation.value,
-        # `estimator` and `threshold_px` are deliberately absent: P3-10 sweeps them *within* a
-        # run, so they are per-row rather than constant. `_row` and `_failed_row` set them from
-        # the variant that produced the row.
-        "warp": WARP_MODEL,
+        # `estimator`, `threshold_px` and `warp` are deliberately absent: P3-10 and P3-4a sweep
+        # all three *within* a run, so they are per-row rather than constant. `_row` and
+        # `_failed_row` set them from the variant that produced the row.
         "moving": config.gt.moving.value,
         "reference": config.gt.reference_modality.value,
         "seed": config.gt.seed,
@@ -428,16 +431,35 @@ def _evaluate(
 
     rows: list[PairRow] = []
     for variant in variants:
-        if variant.method is Estimator.PROSAC and result.confidence is None:
-            rows.append(_unsupported_row(pair, name, variant, identity, result, reported))
+        blocked = _unsupported(variant, result)
+        if blocked is not None:
+            rows.append(_unsupported_row(pair, name, variant, identity, result, reported, blocked))
             continue
         start = time.perf_counter()
         # src is the warped moving image, dst is the reference: the estimate must map the
         # moving image back into the reference frame, which is the direction `truth` describes.
-        estimate = estimate_homography(kpts_moving, kpts_reference, variant, result.confidence)
+        estimate = estimate_warp(kpts_moving, kpts_reference, variant, result.confidence)
         estimate_ms = (time.perf_counter() - start) * 1e3
         rows.append(_row(pair, name, variant, identity, result, estimate, estimate_ms))
     return rows
+
+
+def _unsupported(variant: EstimateConfig, result: MatchResult) -> str | None:
+    """The reason this variant cannot run against this match, or ``None`` if it can.
+
+    Two causes, deliberately distinguished by their tokens because they have different owners.
+    ``estimator_needs_confidence`` is a property of the **matcher** -- PROSAC orders its minimal
+    samples by score and three ``vismatch`` backends return none (TASKS.md P0-2) -- and can
+    differ pair to pair in principle. ``estimator_unsupported_for_warp`` is a property of the
+    **(model, estimator) pair alone**: OpenCV cannot fit a 4-DoF similarity by any USAC method
+    (TASKS.md P3-4a), whatever the matcher supplied. Collapsing them into one token would make a
+    stage-E hole indistinguishable from a stage-D one in the results store.
+    """
+    if not supports(variant.warp_model, variant.method):
+        return UNSUPPORTED_REASON
+    if variant.method is Estimator.PROSAC and result.confidence is None:
+        return "estimator_needs_confidence"
+    return None
 
 
 def _unsupported_row(
@@ -447,29 +469,31 @@ def _unsupported_row(
     identity: dict[str, object],
     result: MatchResult,
     reported: set[tuple[str, str]],
+    reason: str,
 ) -> PairRow:
-    """A row for a variant this matcher cannot support, warned about once.
+    """A row for a variant that cannot run here, warned about once.
 
-    PROSAC draws its minimal samples in descending confidence order, and three of ``vismatch``'s
-    backends return no confidence at all -- ``xfeat`` among them, which is in `experiments/GRID.md`
-    §6's `reduced-8` (TASKS.md P0-2). `estimate/robust.py` raises for that rather than degrading
-    silently to RANSAC, and for a single-estimator run raising is right: it fails identically on
-    every pair. Inside a sweep it is not, because it would discard eleven variants that ran fine
-    *after* the matching has been paid for.
+    `estimate/robust.py` raises for both causes rather than degrading silently, and for a
+    single-variant run raising is right: it fails identically on every pair. Inside a sweep it is
+    not, because it would discard the variants that ran fine *after* the matching they all share
+    has been paid for.
 
     So it is a row, with a reason naming the cause exactly -- which is what X-4 asks for and what
     the fatal path's "6000 rows that all blame the data" objection was actually about. The
-    warning fires once per (matcher, estimator), not 300 times into a console that reaches the
-    Mac by copy-paste.
+    warning fires once per (matcher, warp model, estimator), not 300 times into a console that
+    reaches the Mac by copy-paste.
     """
-    key = (matcher, variant.method.value)
+    key = (matcher, f"{variant.warp_model.value}/{variant.method.value}")
     if key not in reported:
         reported.add(key)
         logger.warning(
-            "%s returns no per-match confidence, so %s cannot run against it; recording every "
-            "pair of that cell as 'estimator_needs_confidence' (TASKS.md P0-2)",
-            matcher,
+            "%s cannot be fitted here: %s (matcher %s, warp %s); recording every pair of that "
+            "cell as '%s'",
             variant.method.value,
+            reason,
+            matcher,
+            variant.warp_model.value,
+            reason,
         )
     # Built through `_row` from a failed `Estimate` rather than through `_failed_row`, because
     # the *matching* really happened: this cell has honest match counts and honest timings, and
@@ -482,7 +506,7 @@ def _unsupported_row(
         n_inliers=0,
         inlier_ratio=0.0,
         reproj_err=float("nan"),
-        failure_reason="estimator_needs_confidence",
+        failure_reason=reason,
     )
     return _row(pair, matcher, variant, identity, result, unsupported, estimate_ms=0.0)
 
@@ -520,7 +544,8 @@ def _row(
         height=pair.shape[0],
         width=pair.shape[1],
         matcher=matcher,
-        # Per row, not per run: P3-10 sweeps these two within a single run directory.
+        # Per row, not per run: P3-10 and P3-4a sweep these three within a single run directory.
+        warp=variant.warp_model.value,
         estimator=variant.method.value,
         threshold_px=variant.threshold_px,
         success=estimate.h is not None,
@@ -567,6 +592,7 @@ def _failed_row(
         height=None if shape is None else shape[0],
         width=None if shape is None else shape[1],
         matcher=matcher,
+        warp=variant.warp_model.value,
         estimator=variant.method.value,
         threshold_px=variant.threshold_px,
         success=False,
@@ -604,6 +630,10 @@ def _variant_label(config: Config, variant: EstimateConfig) -> str:
     The estimator threshold is the same shape of decision. It is constant in stages A-C, so
     including it unconditionally would rename all of them; stage D (P3-10) sweeps it, and
     without it the three thresholds of one estimator would collide into one run name.
+
+    The warp model follows it exactly (TASKS.md P3-4a): homography in stages A-D, so naming it
+    there would rename every run already in W&B, and swept in stage E, where without it three
+    models would collide into one run name.
     """
     label = (
         f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
@@ -611,6 +641,8 @@ def _variant_label(config: Config, variant: EstimateConfig) -> str:
     )
     if config.preprocess.moving_upsample > 1:
         label += f"-{config.preprocess.moving_interpolation.value}"
+    if config.estimate.sweep_warp_models:
+        label += f"-{variant.warp_model.value}"
     label += f"-{variant.method.value}"
     if config.estimate.sweep_thresholds_px:
         label += f"@{variant.threshold_px:g}px"
@@ -635,7 +667,7 @@ def _publish(
     unswept run prints, so a non-sweep run's output is unchanged and a stage driver renders the
     sweep's own tables from Parquet (`scripts/p3d_estimator.py`), as stage C does.
     """
-    anchor = config.estimate.method, config.estimate.threshold_px
+    anchor = config.estimate.warp_model, config.estimate.method, config.estimate.threshold_px
     printed: list[Summary] = []
     for variant, summary in zip(variants, summaries, strict=True):
         matcher = summary.context["matcher"]
@@ -653,7 +685,7 @@ def _publish(
             matcher=matcher,
             preprocess=label,
             estimator=variant.method.value,
-            warp=WARP_MODEL,
+            warp=variant.warp_model.value,
         )
         # The config passed to W&B is the run's own, *unmodified*, so `config_hash` there equals
         # the one stamped on this cell's Parquet rows and the two stores join. Which of the
@@ -663,12 +695,13 @@ def _publish(
             cell,
             tags,
             extra_config={
+                "cell/warp": variant.warp_model.value,
                 "cell/estimator": variant.method.value,
                 "cell/threshold_px": variant.threshold_px,
             },
         ) as tracker:
             tracker.log(summary.metrics)
-        if (variant.method, variant.threshold_px) == anchor:
+        if (variant.warp_model, variant.method, variant.threshold_px) == anchor:
             printed.append(summary)
 
     for summary in printed:

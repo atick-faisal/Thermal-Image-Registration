@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from cmreg.config import EstimateConfig, MatchConfig
-from cmreg.estimate import estimate_homography
+from cmreg.estimate import estimate_warp
 from cmreg.matchers import get_matcher
 from cmreg.metrics import corner_error
 from cmreg.warp import apply_warp
@@ -69,7 +69,7 @@ def test_the_adapter_recovers_a_known_homography() -> None:
 
     # src is the moved image, dst is the reference: the same direction `eval/runner.py`
     # estimates in, so a sign error here is a sign error there.
-    estimate = estimate_homography(result.kpts1, result.kpts0, EstimateConfig(), result.confidence)
+    estimate = estimate_warp(result.kpts1, result.kpts0, EstimateConfig(), result.confidence)
     assert estimate.h is not None
     assert corner_error(estimate.h, np.linalg.inv(homography), SHAPE) < 2.0
 

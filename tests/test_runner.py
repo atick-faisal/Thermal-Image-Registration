@@ -715,6 +715,77 @@ def test_a_swept_run_reproduces_single_estimator_runs_row_for_row(
                 assert row.epe_mean == reference.epe_mean
 
 
+def test_a_swept_warp_run_reproduces_single_model_runs_row_for_row(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The same integrity check as above, for P3-4a's axis -- and it needs its own.
+
+    The estimator sweep's claim rests on OpenCV's solvers carrying no state between calls. The
+    warp sweep adds a second way to be wrong that the estimator sweep cannot exhibit: three
+    *different solvers* now run off one match, and a dispatch that leaked a model between
+    variants -- or lifted the wrong matrix into the shared tail -- would produce a table that
+    looks entirely plausible. Bit-identical, so an order dependence cannot hide inside a
+    tolerance.
+
+    RANSAC throughout, because it is the one estimator all three models admit
+    (`estimate/robust.py::SUPPORTED_ESTIMATORS`); MAGSAC would make the similarity column a hole
+    and test nothing.
+    """
+    models = ("homography", "affine", "similarity")
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept_warp",
+        estimate={"sweep_warp_models": list(models), "method": "ransac"},
+    )
+    run_benchmark(swept)
+    swept_rows = read_rows(tmp_path / "swept_warp")
+
+    for model in models:
+        single = base_config(
+            aligned_dataset / "data.yaml",
+            tmp_path / f"single_{model}",
+            estimate={"warp_model": model, "method": "ransac"},
+        )
+        run_benchmark(single)
+        alone = {row.stem: row for row in read_rows(single.runtime.path)}
+        inside = {row.stem: row for row in swept_rows if row.warp == model}
+        assert inside.keys() == alone.keys(), f"{model} lost pairs"
+        for stem, row in inside.items():
+            reference = alone[stem]
+            assert row.corner_err == reference.corner_err
+            assert row.h == reference.h
+            assert row.n_inliers == reference.n_inliers
+            assert row.epe_mean == reference.epe_mean
+
+
+def test_the_three_warp_models_produce_different_fits(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The axis reaches the solver. Without this, a sweep whose three columns were identical
+    would be PLAN.md §15A's bug -- a swept knob not connected to what it names -- in stage E's
+    shape, and every other assertion here would still pass."""
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "run",
+        estimate={
+            "sweep_warp_models": ["homography", "affine", "similarity"],
+            "method": "ransac",
+        },
+    )
+    run_benchmark(config)
+    rows = [row for row in read_rows(tmp_path / "run") if row.success and row.h is not None]
+    assert rows, "no successful fit to compare"
+    by_stem: dict[str, dict[str, list[float]]] = {}
+    for row in rows:
+        assert row.h is not None
+        by_stem.setdefault(row.stem, {})[row.warp] = row.h
+    fits = next(models for models in by_stem.values() if len(models) == 3)
+    assert len({tuple(h) for h in fits.values()}) == 3
+    # An affine and a similarity have no perspective term whatever the correspondences say.
+    for model in ("affine", "similarity"):
+        assert fits[model][6:] == [0.0, 0.0, 1.0]
+
+
 def test_every_variant_scores_the_same_pairs(aligned_dataset: Path, tmp_path: Path) -> None:
     """A swept directory holds N equally-sized populations, not one pooled one.
 
@@ -766,6 +837,35 @@ def test_an_estimator_the_matcher_cannot_support_is_rows_not_an_abort(
     assert all(row.n_matches > 0 for row in prosac)
     assert [row.n_matches for row in prosac] == [row.n_matches for row in magsac]
     assert any(row.success for row in magsac), "the supported variant is unaffected"
+
+
+def test_a_warp_model_the_estimator_cannot_fit_is_rows_not_an_abort(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The same policy for P3-4a's gap, whose cause is different and whose token says so.
+
+    MAGSAC cannot fit a 4-DoF similarity in opencv 5.0.0 at all. That is a property of the
+    (model, estimator) pair alone, not of the matcher, so stage E's grid genuinely has holes --
+    and a hole recorded as `estimator_unsupported_for_warp` is one a table can name (X-4), where
+    an abort would discard the two models that fitted fine off the same matching.
+    """
+    run_dir = tmp_path / "warp_gap"
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        run_dir,
+        estimate={"sweep_warp_models": ["homography", "similarity"], "method": "magsac"},
+    )
+    run_benchmark(config)
+
+    rows = read_rows(run_dir)
+    similarity = [row for row in rows if row.warp == "similarity"]
+    homography = [row for row in rows if row.warp == "homography"]
+    assert similarity and len(similarity) == len(homography)
+    assert all(row.failure_reason == "estimator_unsupported_for_warp" for row in similarity)
+    assert all(not row.success for row in similarity)
+    # The matching happened; only the fit is missing. Same distinction as the PROSAC gap above.
+    assert [row.n_matches for row in similarity] == [row.n_matches for row in homography]
+    assert any(row.success for row in homography), "the supported model is unaffected"
 
 
 def _register_raising_matcher(name: str) -> None:

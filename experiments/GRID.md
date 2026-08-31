@@ -20,7 +20,7 @@ file and the axis named in it.
 | Tier-1 warp | ±30°, scale 0.8–1.25 log-uniform, perspective 0.05, translation 0.05 | PLAN.md §5's full range. P3-7 once suspected this range of causing `auc_3px = 0`; P1-1a settled that it was not (§3) |
 | preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured the polarity as non-optimal on 3 of 4 datasets** and it stays anyway — see below. **Stage C measured the ×1** and it is the right factor, so the two halves of this row carry opposite caveats |
 | estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default, **and the one field stage D measured and left where it was** (P3-10 F33/F35): MAGSAC is best or tied on the failure-inclusive metric in 15 of 16 (matcher, dataset) cells, and its own threshold row is flat inside the seed noise, so the 3 px is a free choice rather than a tuned one. Frozen for stages E-G on that basis. The 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
-| warp model | homography | the only one implemented (P3-4 adds the rest, and is stage E's precondition) |
+| warp model | homography | **the only one that can reach zero error against this ground truth**, which P3-4a turned from an implementation fact into a measured one. Tier-1 samples a projective warp, so the restricted models carry a floor: on a 640-wide set the best possible affine is **11.47 px** and the best possible similarity **15.77 px** (P3-4a F40). The anchor is the only cell of the axis that is not floored above the reporting ladder |
 | `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
 | seed | 0 | one seed outside stage D; see §5 |
 
@@ -34,6 +34,15 @@ matcher *ordering* it produces is polarity-invariant (Spearman 0.87-0.99 against
 alternatives, same top-ranked matcher in 4/4 datasets) and re-anchoring would invalidate stage
 A and every stage authored against it, to buy at most 11% on one cell. Quote an absolute
 stage-A number with this caveat, and never as evidence that inverting the optical side helps.
+
+**The warp model is a third measured field, and it is the least ambiguous of the three**
+(P3-4a F40/F41). The ×1 and the polarity above were measured against matchers; this one needs
+no matcher at all, because the floor is a property of the sampled warp and the image shape. A
+similarity fit can be scored a success at the headline 5 px on at most **0.7%** of 640-wide
+pairs and an affine on **14.7%**, whatever produced it — so the anchor's `homography` is not a
+default that survived scrutiny but the only entry of the axis that can be scored on this ladder
+at all. The floor is the perspective jitter alone: set `gt.perspective` to 0 and all three
+models floor at exactly 0.00 px.
 
 **The ×1 is the opposite case: measured, and resolved in the anchor's favour** (P3-9 F24/F25).
 Upsampling the thermal side ×3 bicubic — the other half of §15B's recipe — improves 3 of 8
@@ -199,7 +208,7 @@ the only aerial one.
 | B | `invert` on/off, both sides | all 20 | all 4 | 16 | 1 | P3-8 |
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
-| E | homography / affine / similarity / TPS / H+flow | reduced-8 | driving+aerial | 10 | 1 | P3-11 |
+| E | homography / affine / similarity (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
 | F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
@@ -396,8 +405,41 @@ every arm has** -- `xfeat` having no PROSAC cell shifted the printed median enou
 MAGSAC/PROSAC ordering on `flir` (F37). Both now live in `scripts/p3d_estimator.py` and are
 pinned in `tests/test_grid_driver.py::TestStageD`.
 
-Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
-P2-3's degradations) and are listed to fix their shape, not to be launched.
+### Stage E's shape, now that P3-4a has fixed it
+
+**Three models, not five.** The parametric three are implemented; TPS and homography + residual
+flow are P3-4b, because they are dense-field-valued and break `PairRow.h`, `corner_error` and
+the `R` composition (and `cv2`'s TPS transformer no longer exists in OpenCV 5, so the solver is
+hand-written). A five-column stage E waits for them; a three-column one does not.
+
+**Two match passes, not ten cells.** The warp model is downstream of the matcher exactly as the
+estimator is, so it is a third axis of the same sweep: one match pass per dataset feeds three
+fits per pair. At stage C's measured ~19 min per reduced-8 cell and stage D's measured
+**~3.8 single-variant cells per swept pass** (F38 — a variant is an estimate *and a score*), two
+passes is **~2.5 h**, against ~1.3 h for the six cells taken naively. Sweeping is *not* the
+cheaper option at three variants; it is taken because it removes the matcher as a source of
+between-column difference, which is the whole point of the stage.
+
+**The estimator cannot be held fixed across the axis** (P3-4a F39). OpenCV fits a 4-DoF
+similarity by RANSAC and LMEDS only — every USAC method, MAGSAC included, raises. So the anchor
+estimator is unavailable on exactly one of three columns, and holding it fixed would confound
+the model axis with the estimator axis there. **Stage E runs a RANSAC control column** across all
+three models, and reports the MAGSAC column for the two that admit it. P3-10's F33 is what makes
+this affordable to interpret: the four estimators sit inside the seed noise on the
+failure-inclusive metric, so a RANSAC-versus-MAGSAC difference is already known to be small —
+but it is *measured* small, not assumed, and the control column is what lets the stage say so.
+
+**The stage's own conclusion is bounded before it runs** (F40). Both restricted models are
+floored above the 5 px headline: their `success_rate_5px` cannot exceed 0.007 and 0.147. So the
+stage cannot find that a restricted model wins on the headline threshold, and it should be read
+— and budgeted — as answering a narrower question: *how much of the homography's advantage is the
+extra capacity actually delivering, against how much the ground truth simply hands it?* Report
+every row beside its floor, exactly as GRID.md §3's composed rows are reported beside `R`. If
+the measured gap between a model and its own floor is smaller than the gap between models, the
+axis is reporting the ground truth's perspective content and the paper should say so (X-4).
+
+Stages F and G have unmet preconditions (P2-2's overlap generator, P2-3's degradations) and are
+listed to fix their shape, not to be launched.
 
 ## 7. Cost
 

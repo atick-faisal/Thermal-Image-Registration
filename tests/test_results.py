@@ -195,6 +195,33 @@ def test_the_comparison_table_has_one_row_per_matcher() -> None:
     assert "  " in table.splitlines()[1]
 
 
+def test_distinct_matchers_are_labelled_by_the_matcher_alone() -> None:
+    """The label is disambiguated only as far as it has to be.
+
+    Every stage A-C block has distinct matchers, and those blocks are already pasted into
+    TASKS.md; widening their labels would make a re-render undiffable against the record.
+    """
+    summaries = [
+        summarize([make_row("a", matcher="sift")], THRESHOLDS),
+        summarize([make_row("a", matcher="orb")], THRESHOLDS),
+    ]
+    table = render_comparison(summaries, ("reg/mace",))
+    assert "sift " in table
+    assert "[" not in table
+
+
+def test_cells_of_one_matcher_are_labelled_by_what_varies() -> None:
+    """A swept directory repeats the matcher, and a table whose rows cannot be told apart is
+    worse than no table -- this block reaches the Mac by copy-paste and cannot be asked."""
+    summaries = [
+        summarize([make_row("a", matcher="sift", warp="homography")], THRESHOLDS),
+        summarize([make_row("a", matcher="sift", warp="affine")], THRESHOLDS),
+    ]
+    table = render_comparison(summaries, ("reg/mace",))
+    assert "sift [homography/" in table
+    assert "sift [affine/" in table
+
+
 def test_a_file_predating_a_nullable_column_reads_as_null(tmp_path: Path) -> None:
     """Additive columns must not retroactively destroy every run on disk.
 

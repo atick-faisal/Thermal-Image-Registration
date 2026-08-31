@@ -20,7 +20,15 @@ from pathlib import Path
 from typing import Any
 
 from cmreg import __version__
-from cmreg.config.schema import Domain, Estimator, Interpolation, Modality, Platform, Variant
+from cmreg.config.schema import (
+    Domain,
+    Estimator,
+    Interpolation,
+    Modality,
+    Platform,
+    Variant,
+    WarpModel,
+)
 
 logger = logging.getLogger("cmreg")
 
@@ -35,6 +43,7 @@ _VARIANTS = [v.value for v in Variant]
 _INTERPOLATIONS = [i.value for i in Interpolation]
 _MODALITIES = [m.value for m in Modality]
 _DOMAINS = [d.value for d in Domain]
+_WARP_MODELS = [m.value for m in WarpModel]
 _PLATFORMS = [p.value for p in Platform]
 
 # flag name -> dotted path into the config. See convention 2 above.
@@ -57,6 +66,8 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "threshold": ("estimate", "threshold_px"),
     "sweep_estimators": ("estimate", "sweep_methods"),
     "sweep_thresholds": ("estimate", "sweep_thresholds_px"),
+    "warp_model": ("estimate", "warp_model"),
+    "sweep_warp_models": ("estimate", "sweep_warp_models"),
     "preprocess_ref": ("preprocess", "reference"),
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
@@ -142,6 +153,17 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         dest="sweep_estimators",
         type=_comma_separated,
         help="comma-separated estimators to sweep, e.g. 'magsac,ransac,lmeds,prosac' (P3-10)",
+    )
+    # Stage E's axis (P3-4a, P3-11). Swept by the same machinery and for the same reason as the
+    # estimator: which transform is fitted is downstream of finding the correspondences, so N
+    # models cost N fits off one match rather than N match passes. `--warp-model` still names
+    # the anchor, which `EstimateConfig` requires to be one of the swept cells.
+    parser.add_argument("--warp-model", dest="warp_model", choices=_WARP_MODELS)
+    parser.add_argument(
+        "--sweep-warp-models",
+        dest="sweep_warp_models",
+        type=_comma_separated,
+        help="comma-separated warp models to sweep, e.g. 'homography,affine,similarity' (P3-4a)",
     )
     parser.add_argument(
         "--sweep-thresholds",
@@ -373,18 +395,24 @@ def _run_report(args: argparse.Namespace) -> int:
     from cmreg.results import read_rows, render, render_comparison, summarize
 
     rows = read_rows(args.run_dir)
-    # Grouped by (matcher, estimator, threshold), not by matcher alone: P3-10 sweeps the
-    # estimator *inside* one run directory, and grouping on the matcher would pool twelve
-    # estimators into a single summary that describes none of them. Identical for every
-    # unswept directory, where each matcher has exactly one estimation cell.
+    # Grouped by (matcher, warp, estimator, threshold), not by matcher alone: P3-10 sweeps the
+    # estimator and P3-4a the warp model *inside* one run directory, and grouping on the matcher
+    # would pool twelve estimators, or three models, into a single summary that describes none of
+    # them. Identical for every unswept directory, where each matcher has exactly one cell.
     #
     # First-appearance order rather than sorted: it is the order the run produced them in,
     # which is the order the original block was printed in, so a re-render is diffable against
     # a pasted one.
-    cells = list(dict.fromkeys((row.matcher, row.estimator, row.threshold_px) for row in rows))
+    cells = list(
+        dict.fromkeys((row.matcher, row.warp, row.estimator, row.threshold_px) for row in rows)
+    )
     summaries = [
         summarize(
-            [row for row in rows if (row.matcher, row.estimator, row.threshold_px) == cell],
+            [
+                row
+                for row in rows
+                if (row.matcher, row.warp, row.estimator, row.threshold_px) == cell
+            ],
             tuple(args.thresholds),
         )
         for cell in cells

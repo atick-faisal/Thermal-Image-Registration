@@ -90,6 +90,25 @@ class Estimator(StrEnum):
     PROSAC = "prosac"
 
 
+class WarpModel(StrEnum):
+    """The transform fitted to the correspondences (TASKS.md P3-4, PLAN.md §4.1).
+
+    The three parametric models, all of which are 3x3 matrices and therefore share every
+    downstream consumer -- ``dense_displacement``, ``corner_error``, the diagonal saturation,
+    ``PairRow.h``'s nine floats and P2-12's residual composition all work unchanged. TPS and
+    homography + residual flow are the *dense-field* half of P3-4 and land as P3-4b; they break
+    each of those, which is why they are a separate task and not a fourth entry here yet.
+
+    None of the three can reach zero error against this benchmark's ground truth: Tier-1 samples
+    a full projective homography, so the restricted models carry a **floor** in exactly the sense
+    `experiments/GRID.md` §3's `R` does (`warp/floor.py`).
+    """
+
+    HOMOGRAPHY = "homography"
+    AFFINE = "affine"
+    SIMILARITY = "similarity"
+
+
 class RuntimeConfig(ConfigBase):
     """Where and how a run executes. **Excluded wholesale from `config_hash()`** -- the same
     experiment on two machines under two names must carry one hash, or the hash means
@@ -387,6 +406,16 @@ class EstimateConfig(ConfigBase):
     # `mask`, and PLAN.md §15A records the upstream harness losing this value to exactly that
     # off-by-one -- its confidence silently stayed at OpenCV's 0.995 default.
     confidence: float = 0.9999
+    # Which transform is fitted (TASKS.md P3-4). Restricting the model *cannot* help against
+    # Tier-1's projective ground truth -- it can only trade capacity for stability -- so a
+    # non-default value left in a config silently reports a row that is floored below the
+    # homography one by construction (`warp/floor.py` measures by how much).
+    #
+    # **Not every estimator can fit every model**, and the gap is asymmetric: OpenCV's 4-DoF
+    # `estimateAffinePartial2D` accepts only RANSAC and LMEDS, so the anchor's MAGSAC cannot run
+    # against `similarity` at all (`estimate/robust.py::SUPPORTED_ESTIMATORS`). A sweep across
+    # both axes therefore has holes, which are recorded as rows rather than aborted.
+    warp_model: WarpModel = WarpModel.HOMOGRAPHY
     # --- the P3-10 sweep axis ----------------------------------------------------------
     # Which estimators to run. The axis is **downstream of the matcher**:
     # `eval/runner.py::_evaluate` matches once and then estimates many times off the one
@@ -401,6 +430,12 @@ class EstimateConfig(ConfigBase):
     # driver prints that as an explicit check, because a sweep whose knob is not connected to
     # the solver is exactly the PLAN.md §15A failure this module exists to avoid.
     sweep_thresholds_px: tuple[float, ...] = ()
+    # Stage E's axis (TASKS.md P3-11), swept by the same machinery for the same reason: the warp
+    # model is downstream of the matcher, so N models cost N fits off one `MatchResult` rather
+    # than N match passes. Empty means "not swept". Failure mode: a value left in a config that
+    # is not stage E multiplies the run's rows by the model count -- visible in the `warp`
+    # column, but a surprise to anyone reading the row count.
+    sweep_warp_models: tuple[WarpModel, ...] = ()
 
     @field_validator("threshold_px")
     @classmethod
@@ -444,6 +479,13 @@ class EstimateConfig(ConfigBase):
             raise ValueError(f"sweep_thresholds_px must be ascending, got {value}")
         return value
 
+    @field_validator("sweep_warp_models")
+    @classmethod
+    def _unique_models(cls, value: tuple[WarpModel, ...]) -> tuple[WarpModel, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"sweep_warp_models contains duplicates: {value}")
+        return value
+
     @model_validator(mode="after")
     def _anchor_is_inside_the_sweep(self) -> Self:
         """The scalar anchor must be one of the swept cells.
@@ -463,12 +505,17 @@ class EstimateConfig(ConfigBase):
                 f"threshold_px {self.threshold_px:g} must appear in sweep_thresholds_px "
                 f"{list(self.sweep_thresholds_px)}"
             )
+        if self.sweep_warp_models and self.warp_model not in self.sweep_warp_models:
+            raise ValueError(
+                f"warp_model {self.warp_model.value!r} must appear in sweep_warp_models "
+                f"{[m.value for m in self.sweep_warp_models]}"
+            )
         return self
 
     @property
     def is_sweeping(self) -> bool:
         """True when this config resolves to more than one estimation cell."""
-        return bool(self.sweep_methods or self.sweep_thresholds_px)
+        return bool(self.sweep_methods or self.sweep_thresholds_px or self.sweep_warp_models)
 
     def variants(self) -> tuple[EstimateConfig, ...]:
         """Every estimation cell this config describes, anchor first on each unswept axis.
@@ -478,17 +525,24 @@ class EstimateConfig(ConfigBase):
         ``tests/test_runner.py``'s claim that a swept run reproduces single-estimator runs row
         for row a statement about the config layer as well as the runner.
         """
+        models = self.sweep_warp_models or (self.warp_model,)
         methods = self.sweep_methods or (self.method,)
         thresholds = self.sweep_thresholds_px or (self.threshold_px,)
+        # Model-outer, so a swept directory groups by warp model first: that is the order stage
+        # E's tables read in, and `eval/runner.py::_rows_for` filters on the columns rather than
+        # on position precisely so the two cannot disagree.
         return tuple(
             self.model_copy(
                 update={
+                    "warp_model": model,
                     "method": method,
                     "threshold_px": threshold,
                     "sweep_methods": (),
                     "sweep_thresholds_px": (),
+                    "sweep_warp_models": (),
                 }
             )
+            for model in models
             for method in methods
             for threshold in thresholds
         )
@@ -553,14 +607,26 @@ class Config(ConfigBase):
         that altered no science. A swept config still hashes apart from an unswept one, which
         is the property the guard actually needs.
 
+        **P3-4's `warp_model` is dropped at its default** for that same reason, and it needs the
+        rule stated differently because it is a *scalar*: an empty list is absent when the axis
+        is unused, but `warp_model` always has a value, so the payload has to drop it when that
+        value is the one every run before P3-4 implicitly used. `homography` is that value.
+        Stages A-D are all homography, so their directories keep the hashes they were scored
+        under; anything that actually fits a different model hashes apart, which is what the
+        guard needs. The consequence to accept: an `affine` run and a `homography` run differ in
+        the hash, and a *future* change of the default would silently re-point this exemption --
+        which is why the default is named in the test that pins it, not just here.
+
         Deliberately narrow rather than `exclude_defaults=True`: that would drop every
         defaulted field at once and move all the existing hashes it is here to preserve.
         """
         payload = self.model_dump(mode="json", exclude={"runtime"})
         estimate = payload["estimate"]
-        for axis in ("sweep_methods", "sweep_thresholds_px"):
+        for axis in ("sweep_methods", "sweep_thresholds_px", "sweep_warp_models"):
             if not estimate[axis]:
                 del estimate[axis]
+        if estimate["warp_model"] == WarpModel.HOMOGRAPHY.value:
+            del estimate["warp_model"]
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[
             :_HASH_LENGTH
         ]

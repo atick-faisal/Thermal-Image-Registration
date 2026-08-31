@@ -15,6 +15,7 @@ from cmreg.config import (
     EstimateConfig,
     Estimator,
     Platform,
+    WarpModel,
     deep_merge,
 )
 
@@ -168,6 +169,45 @@ def test_the_sweep_is_the_cross_product_of_the_two_axes() -> None:
     ]
 
 
+def test_the_warp_model_is_the_third_axis_of_the_same_sweep() -> None:
+    """P3-4a. Model-outer, so a swept directory groups by warp model first."""
+    config = EstimateConfig(
+        sweep_warp_models=(WarpModel.HOMOGRAPHY, WarpModel.AFFINE),
+        sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS),
+    )
+    assert [(v.warp_model.value, v.method.value) for v in config.variants()] == [
+        ("homography", "magsac"),
+        ("homography", "lmeds"),
+        ("affine", "magsac"),
+        ("affine", "lmeds"),
+    ]
+
+
+def test_the_default_config_hash_is_unchanged_by_the_warp_model_field() -> None:
+    """The P3-4a exemption in `Config.config_hash`, pinned rather than trusted.
+
+    `warp_model` is a *scalar* with a default, so unlike P3-10's empty sweep lists it would move
+    every hash in the project -- and `scripts/stages.py::refuse_a_stale_run` would then refuse
+    every completed stage A-D directory on the server for a change that altered no science. The
+    literal below is the hash those directories were scored under; it must not move again.
+
+    The exemption is keyed on `homography` specifically, so this test also fails if the default
+    is ever changed, which is the point at which the exemption would silently re-point.
+    """
+    assert EstimateConfig().warp_model is WarpModel.HOMOGRAPHY
+    assert Config().config_hash() == "04f02efbd8b566ed"
+
+
+def test_a_non_default_warp_model_hashes_apart() -> None:
+    """The property the resume guard actually needs: a run fitting a different model is a
+    different experiment, and resuming one onto the other's directory is refused."""
+    default = Config()
+    affine = default.model_copy(
+        update={"estimate": default.estimate.model_copy(update={"warp_model": WarpModel.AFFINE})}
+    )
+    assert affine.config_hash() != default.config_hash()
+
+
 def test_the_axes_sweep_independently() -> None:
     """`sweep_methods` alone is four cells, not twelve: the unswept axis falls back to its
     scalar rather than being treated as empty."""
@@ -195,6 +235,11 @@ def test_the_anchor_must_be_one_of_the_swept_cells() -> None:
         EstimateConfig(method=Estimator.RANSAC, sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS))
     with pytest.raises(ValidationError):
         EstimateConfig(threshold_px=7.0, sweep_thresholds_px=(1.0, 3.0))
+    with pytest.raises(ValidationError):
+        EstimateConfig(
+            warp_model=WarpModel.SIMILARITY,
+            sweep_warp_models=(WarpModel.HOMOGRAPHY, WarpModel.AFFINE),
+        )
 
 
 def test_swept_thresholds_must_be_ascending_and_unique() -> None:

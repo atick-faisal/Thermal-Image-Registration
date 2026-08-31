@@ -18,6 +18,7 @@ from cmreg.config.schema import (
     PreprocessConfig,
     RuntimeConfig,
     Variant,
+    WarpModel,
 )
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "PreprocessConfig",
     "RuntimeConfig",
     "Variant",
+    "WarpModel",
     "as_config_error",
     "deep_merge",
 ]

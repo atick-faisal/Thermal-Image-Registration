@@ -3,6 +3,6 @@ rows to Parquet plus the copy-pasteable console block."""
 
 from __future__ import annotations
 
-from cmreg.eval.runner import COMPARISON_KEYS, WARP_MODEL, RunnerError, run_benchmark
+from cmreg.eval.runner import COMPARISON_KEYS, RunnerError, run_benchmark
 
-__all__ = ["COMPARISON_KEYS", "WARP_MODEL", "RunnerError", "run_benchmark"]
+__all__ = ["COMPARISON_KEYS", "RunnerError", "run_benchmark"]

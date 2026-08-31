@@ -5,7 +5,7 @@
 C's measured ~19 min per reduced-8 cell is ~38 h. Almost all of it is waste.
 
 **The estimator axis is downstream of the matcher.** `eval/runner.py::_evaluate` matches once
-and then calls `estimate_homography`; `config.estimate` is the only thing this stage varies. The
+and then calls `estimate_warp`; `config.estimate` is the only thing this stage varies. The
 frozen grid re-runs RoMa twelve times per pair to change a RANSAC threshold. Sweeping *inside*
 the pair loop instead is **10 match passes** -- 2 datasets x 5 seeds, and the seeds genuinely do
 need re-matching, since `gt.seed` draws the synthetic warp and `seed_cell` seeds the matcher's

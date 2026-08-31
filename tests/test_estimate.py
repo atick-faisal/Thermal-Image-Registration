@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from cmreg.config import EstimateConfig, Estimator, GTConfig
-from cmreg.estimate import EstimateError, estimate_homography, symmetric_reprojection_error
+from cmreg.estimate import EstimateError, estimate_warp, symmetric_reprojection_error
 from cmreg.gt import generator, sample_homography
 from cmreg.metrics import corner_error
 from cmreg.warp import warp_points
@@ -57,7 +57,7 @@ def test_clean_correspondences_recover_the_homography_exactly(
     correspondences: tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> None:
     src, dst, confidence = correspondences
-    estimate = estimate_homography(src, dst, EstimateConfig(method=method), confidence)
+    estimate = estimate_warp(src, dst, EstimateConfig(method=method), confidence)
     assert not estimate.failed
     assert estimate.h is not None
     assert corner_error(estimate.h, truth, SHAPE) < 1e-3
@@ -70,7 +70,7 @@ def test_forty_percent_outliers_are_rejected(
     contaminated: tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> None:
     src, dst, confidence = contaminated
-    estimate = estimate_homography(src, dst, EstimateConfig(method=method), confidence)
+    estimate = estimate_warp(src, dst, EstimateConfig(method=method), confidence)
     assert not estimate.failed
     assert estimate.h is not None
     assert corner_error(estimate.h, truth, SHAPE) < 1.0
@@ -87,7 +87,7 @@ def test_the_inlier_mask_indexes_the_callers_correspondences(
     the reordering is not undone, `inlier_mask` silently points at the wrong matches -- which
     nothing downstream would notice until a per-match analysis in Phase 6."""
     src, dst, confidence = contaminated
-    estimate = estimate_homography(src, dst, EstimateConfig(method=method), confidence)
+    estimate = estimate_warp(src, dst, EstimateConfig(method=method), confidence)
     assert estimate.h is not None
     assert estimate.inlier_mask.shape == (N_POINTS,)
     residual = np.linalg.norm(warp_points(src, estimate.h) - dst, axis=1)
@@ -96,7 +96,7 @@ def test_the_inlier_mask_indexes_the_callers_correspondences(
 
 
 def test_too_few_matches_is_a_value_not_an_exception() -> None:
-    estimate = estimate_homography(np.zeros((3, 2)), np.zeros((3, 2)), EstimateConfig())
+    estimate = estimate_warp(np.zeros((3, 2)), np.zeros((3, 2)), EstimateConfig())
     assert estimate.failed
     assert estimate.failure_reason == "too_few_matches"
     assert estimate.inlier_mask.shape == (3,)
@@ -108,7 +108,7 @@ def test_degenerate_correspondences_fail_rather_than_returning_a_singular_matrix
     image rather than raising, which reads downstream as a catastrophic registration failure
     instead of a bad estimate."""
     points = np.zeros((8, 2))
-    estimate = estimate_homography(points, points, EstimateConfig())
+    estimate = estimate_warp(points, points, EstimateConfig())
     assert estimate.failed
 
 
@@ -119,12 +119,12 @@ def test_prosac_without_confidences_refuses_to_run(
     was not produced by PROSAC."""
     src, dst, _ = correspondences
     with pytest.raises(EstimateError, match="PROSAC"):
-        estimate_homography(src, dst, EstimateConfig(method=Estimator.PROSAC))
+        estimate_warp(src, dst, EstimateConfig(method=Estimator.PROSAC))
 
 
 def test_mismatched_correspondence_counts_are_rejected() -> None:
     with pytest.raises(EstimateError, match="counts differ"):
-        estimate_homography(np.zeros((5, 2)), np.zeros((6, 2)), EstimateConfig())
+        estimate_warp(np.zeros((5, 2)), np.zeros((6, 2)), EstimateConfig())
 
 
 def test_reprojection_error_is_symmetric(truth: np.ndarray) -> None:
@@ -167,10 +167,10 @@ def test_repeated_fits_on_one_input_are_bit_identical(
     """
     source, target, confidence = contaminated
     config = EstimateConfig(method=method)
-    first = estimate_homography(source, target, config, confidence).h
+    first = estimate_warp(source, target, config, confidence).h
     assert first is not None
     for _ in range(3):
-        again = estimate_homography(source, target, config, confidence).h
+        again = estimate_warp(source, target, config, confidence).h
         assert again is not None
         assert np.array_equal(again, first)
 
@@ -182,9 +182,9 @@ def test_a_fit_does_not_depend_on_what_was_fitted_before_it(
     """The sweep runs the four estimators back to back off one match; interleaving them must
     not change any of their answers. The test above pins repetition, this pins *order*."""
     source, target, confidence = contaminated
-    alone = estimate_homography(source, target, EstimateConfig(method=method), confidence)
+    alone = estimate_warp(source, target, EstimateConfig(method=method), confidence)
     for other in ESTIMATORS:
-        estimate_homography(source, target, EstimateConfig(method=other), confidence)
-    after = estimate_homography(source, target, EstimateConfig(method=method), confidence)
+        estimate_warp(source, target, EstimateConfig(method=other), confidence)
+    after = estimate_warp(source, target, EstimateConfig(method=method), confidence)
     assert alone.h is not None and after.h is not None
     assert np.array_equal(after.h, alone.h)

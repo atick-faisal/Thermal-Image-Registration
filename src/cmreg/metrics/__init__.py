@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cmreg.metrics.floor import model_floor
 from cmreg.metrics.registration import (
     EndPointError,
     MetricError,
@@ -22,6 +23,7 @@ __all__ = [
     "corner_error",
     "diagonal",
     "endpoint_error",
+    "model_floor",
     "success_rate",
     "success_rate_key",
 ]

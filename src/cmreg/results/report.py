@@ -165,15 +165,33 @@ def _format(key: str, value: float) -> str:
     return f"{value:.0f}" if key.endswith("n_pairs") else f"{value:.4f}"
 
 
+def _row_names(summaries: Sequence[Summary]) -> list[str]:
+    """One label per row, disambiguated only as far as it has to be.
+
+    The matcher alone, whenever the matchers are distinct -- which is every stage A-C table, and
+    what keeps those blocks byte-identical to the ones already pasted into TASKS.md. A run that
+    sweeps *within* a matcher (P3-10's estimator, P3-4a's warp model) repeats it, and a table
+    whose rows cannot be told apart is worse than no table: this block is how results reach the
+    Mac from the training server, and a reader cannot ask it which row was which.
+    """
+    matchers = [str(summary.context["matcher"]) for summary in summaries]
+    if len(set(matchers)) == len(matchers):
+        return matchers
+    return [
+        f"{matcher} [{summary.context['warp']}/{summary.context['estimator']}]"
+        for matcher, summary in zip(matchers, summaries, strict=True)
+    ]
+
+
 def render_comparison(summaries: Sequence[Summary], keys: Sequence[str]) -> str:
-    """A matcher-per-row table across a chosen metric subset, for multi-matcher runs."""
+    """A cell-per-row table across a chosen metric subset, for multi-cell runs."""
     if not summaries:
         raise ReportError("cannot compare zero summaries")
     # Widened to the longest name present rather than fixed: `matchanything-eloftr` is 20
     # characters and a fixed 16 pushes its row one column out of alignment, which is exactly
     # the kind of damage a copy-pasted block cannot survive -- this table is how results reach
     # the Mac from the training server, so it has to stay readable as plain text.
-    names = [str(summary.context["matcher"]) for summary in summaries]
+    names = _row_names(summaries)
     name_width = max(len("matcher"), *(len(name) for name in names)) + 2
     header = f"{'matcher':<{name_width}}" + "".join(
         f"{key.split('/')[-1]:>{_COLUMN_WIDTH}}" for key in keys

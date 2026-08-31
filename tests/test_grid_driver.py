@@ -17,6 +17,7 @@ import pytest
 import p3_stageb_polarity  # on the path via `[tool.pytest.ini_options] pythonpath`
 import p3c_upsample
 import p3d_estimator
+import p3e_warp
 import stages
 from cmreg.metrics.schema import FAILURE_RATE
 from cmreg.results import write_rows
@@ -429,4 +430,206 @@ def _estimator_rows(magsac_moves: bool = True) -> p3d_estimator.Rows:
                 make_row(stem, h=[1.0, 0.0, offset, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
                 for stem in ("a", "b")
             ]
+    return rows
+
+
+class TestStageE:
+    """`scripts/p3e_warp.py` (P3-11). The stage whose conclusion is bounded before it runs.
+
+    Three things are worth pinning here, and they are the three a reader of the pasted table
+    cannot check for themselves: the arithmetic that makes two match passes legitimate, the
+    `similarity/magsac` hole being a *named* row rather than a silent `--` (X-4), and the excess
+    block's verdict -- which is the only place the stage distinguishes "the homography has more
+    capacity" from "Tier-1's ground truth is projective and hands it the win".
+    """
+
+    def test_the_stage_is_two_match_passes_carrying_six_variants_each(self) -> None:
+        """The cost model. GRID.md §6: the warp model is downstream of the matcher exactly as
+        the estimator is, so one match pass per dataset feeds three fits per pair per estimator.
+        If this ever becomes one invocation per variant, the stage re-runs RoMa six times to
+        change which matrix `cv2` fits."""
+        passes = [
+            p3e_warp.run_dir_for(cell) for cell in stages.CELLS if cell.dataset in p3e_warp.DATASETS
+        ]
+        assert len(passes) == 2
+        assert len(set(passes)) == len(passes)
+        assert len(p3e_warp.MODELS) * len(p3e_warp.ESTIMATORS) == 6
+
+    def test_the_invocation_resolves_to_the_six_variants_over_reduced_eight(self) -> None:
+        """Resolved through `cmreg`'s own parser, not rebuilt here. Also pins that the anchor --
+        the variant whose console block the runner prints -- is one of the swept cells, which is
+        the condition `EstimateConfig` enforces at load."""
+        from cmreg.cli import build_parser, overrides_from_args
+        from cmreg.config import Config
+
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        args = build_parser().parse_args(p3e_warp.argv_for(cell))
+        config = Config.load(args.config, overrides_from_args(args))
+        variants = config.estimate.variants()
+
+        assert len(variants) == 6
+        assert config.match.matchers == stages.REDUCED_8
+        anchor = (config.estimate.warp_model.value, config.estimate.method.value)
+        assert anchor == p3e_warp.ANCHOR
+        assert anchor in [(v.warp_model.value, v.method.value) for v in variants]
+        # One axis at a time: the threshold is frozen at stage D's anchor across all six.
+        assert {v.threshold_px for v in variants} == {p3e_warp.THRESHOLD}
+
+    def test_the_run_argv_is_the_scientific_argv_plus_the_invocation(self) -> None:
+        """`floors_for` and the test above resolve `argv_for`, and the server runs `run`. If the
+        two could drift, every floor printed beside a row would belong to a different config
+        than the row does -- which is invisible in the table and wrong in the third decimal."""
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        scientific = p3e_warp.argv_for(cell)
+        assert _stage_e_argv(cell)[: len(scientific)] == scientific
+
+    def test_similarity_under_magsac_is_a_named_row_and_not_a_silent_hole(self) -> None:
+        """P3-4a F39: OpenCV fits a 4-DoF similarity by RANSAC and LMEDS only, so the anchor
+        estimator is unavailable on exactly one of three columns. X-4 makes that a row carrying
+        its reason, and this stage's table has to say so where it prints `--`."""
+        from cmreg.config import Estimator, WarpModel
+        from cmreg.estimate import SUPPORTED_ESTIMATORS
+
+        assert Estimator.MAGSAC not in SUPPORTED_ESTIMATORS[WarpModel.SIMILARITY]
+        assert Estimator.RANSAC in SUPPORTED_ESTIMATORS[WarpModel.SIMILARITY]
+        assert Estimator.RANSAC.value == p3e_warp.CONTROL
+
+        rows = _warp_rows({"homography": 6.0, "affine": 12.0})
+        note = p3e_warp._unsupported_note(rows, "magsac")
+        assert note is not None and "similarity" in note
+        table = p3e_warp.model_table(
+            next(c for c in stages.CELLS if c.dataset == "flir"),
+            "magsac",
+            _warp_series({"homography": 6.0, "affine": 12.0}),
+            rows,
+            _warp_floors(),
+        )
+        assert note in table
+        # The column exists and is empty, rather than being absent from the table entirely.
+        assert "similarity" in table
+        assert table.splitlines()[-2].endswith("--")
+
+    def test_the_excess_block_calls_a_floored_gap_the_ground_truth(self) -> None:
+        """The block the stage exists for (GRID.md §6). Built so all three models sit exactly
+        2 px above their own floors and the raw mace differs by the floor gap alone: the honest
+        reading is that the axis measured the ground truth, and a table without the floor column
+        would have reported a 15 px 'capacity' win."""
+        mace = {"homography": 2.0, "affine": 12.0, "similarity": 17.0}
+        block = p3e_warp.excess_block(
+            {"flir": _warp_rows(mace)}, {"flir": _warp_series(mace)}, {"flir": _warp_floors()}
+        )
+        assert "GROUND TRUTH" in block
+        assert "CAPACITY" not in block
+
+    def test_the_excess_block_calls_an_unfloored_gap_capacity(self) -> None:
+        """The converse, which is the reading that would licence the axis as a result: the
+        restricted models are far above their own floors, so most of the gap survives it."""
+        mace = {"homography": 2.0, "affine": 60.0, "similarity": 80.0}
+        block = p3e_warp.excess_block(
+            {"flir": _warp_rows(mace)}, {"flir": _warp_series(mace)}, {"flir": _warp_floors()}
+        )
+        assert "CAPACITY" in block
+        assert "GROUND TRUTH" not in block
+
+    def test_a_median_over_matchers_is_not_shifted_by_a_model_that_lacks_one(self) -> None:
+        """F37 in this stage's shape. A matcher that failed every pair under one model has no
+        mace there, and a median over 'whatever this model has' would compare a median over
+        three matchers with one over four."""
+        series = _warp_series({"homography": 5.0}, per_matcher={"affine": {"m1": 9.0, "m2": 10.0}})
+        assert p3e_warp._common_matchers(series) == ["m1", "m2"]
+        assert "m3 excluded" in p3e_warp.control_block({"flir": series}, p3e_warp.HEADLINE)
+
+    def test_a_cell_opencv_cannot_fit_is_not_reported_as_the_cheapest_one(self) -> None:
+        """`estimator_unsupported_for_warp` rows carry `estimate_ms=0.0` truthfully -- nothing
+        was estimated -- and a cost table that prints that as `0.00` ranks the one column that
+        could not run as the fastest on the page."""
+        block = p3e_warp.cost_block(
+            {"flir": _warp_series({"homography": 5.0})}, {"flir": _warp_rows()}
+        )
+        (row,) = [line for line in block.splitlines() if line.startswith("m1")]
+        assert row.split()[-2] == "--"  # simi/magsac
+        assert row.split()[-1] != "--"  # simi/ransac ran
+
+
+def _stage_e_argv(cell: stages.Cell) -> list[str]:
+    """The argv `p3e_warp.run` would build, captured without running anything."""
+    captured: list[list[str]] = []
+    original = p3e_warp.run_cell
+    p3e_warp.run_cell = lambda _cell, _dir, argv, _banner: captured.append(argv) or True
+    try:
+        p3e_warp.run(cell, "cpu", stages.DryRun(wandb=False))
+    finally:
+        p3e_warp.run_cell = original
+    return captured[0]
+
+
+# Two pairs' floors, chosen so the affine floor (10 px) is most of any plausible affine error and
+# the homography floor is exactly zero -- which is what it is by construction (P3-4a F41).
+_FLOOR = {"homography": 0.0, "affine": 10.0, "similarity": 15.0}
+
+
+def _warp_floors() -> p3e_warp.Floors:
+    return {stem: dict(_FLOOR) for stem in ("a", "b")}
+
+
+def _warp_series(
+    mace: dict[str, float],
+    per_matcher: dict[str, dict[str, float]] | None = None,
+    matchers: tuple[str, ...] = ("m1", "m2", "m3"),
+) -> p3e_warp.Series:
+    """One dataset's summarised cells, flat across the estimator axis.
+
+    `per_matcher` names a model whose cells exist for *some* matchers only, which is how a model
+    that solved nothing for one matcher is expressed. `similarity` is absent under `magsac`
+    throughout, because OpenCV cannot fit it there at all (F39).
+    """
+    overrides = per_matcher or {}
+    series: p3e_warp.Series = {}
+    for model in p3e_warp.MODELS:
+        for estimator in p3e_warp.ESTIMATORS:
+            if model == "similarity" and estimator == "magsac":
+                continue
+            values = overrides.get(model) or {
+                matcher: mace.get(model, 20.0) for matcher in matchers
+            }
+            for matcher, value in values.items():
+                series[model, estimator, matcher] = [
+                    {
+                        p3e_warp.HEADLINE: value,
+                        p3e_warp.SECONDARY: 0.5,
+                        FAILURE_RATE: 0.0,
+                        "reg/n_pairs": 300.0,
+                        "time/estimate_ms": 1.0,
+                    }
+                ]
+    return series
+
+
+def _warp_rows(
+    mace: dict[str, float] | None = None, matchers: tuple[str, ...] = ("m1", "m2", "m3")
+) -> p3e_warp.Rows:
+    """Two pairs per (model, estimator, matcher), `similarity/magsac` recorded as unsupported.
+
+    Takes the same `mace` dict `_warp_series` does, so the per-pair rows the excess block reads
+    and the summarised cells the raw-mace column reads cannot disagree -- which is the whole
+    thing that block is comparing.
+    """
+    errors = mace or {}
+    rows: p3e_warp.Rows = {}
+    for model in p3e_warp.MODELS:
+        for estimator in p3e_warp.ESTIMATORS:
+            unsupported = model == "similarity" and estimator == "magsac"
+            for matcher in matchers:
+                rows[model, estimator, matcher] = [
+                    make_row(
+                        stem,
+                        matcher=matcher,
+                        warp=model,
+                        estimator=estimator,
+                        success=not unsupported,
+                        failure_reason="estimator_unsupported_for_warp" if unsupported else None,
+                        corner_err=None if unsupported else errors.get(model, 20.0),
+                    )
+                    for stem in ("a", "b")
+                ]
     return rows

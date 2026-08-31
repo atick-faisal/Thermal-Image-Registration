@@ -20,7 +20,7 @@ file and the axis named in it.
 | Tier-1 warp | ±30°, scale 0.8–1.25 log-uniform, perspective 0.05, translation 0.05 | PLAN.md §5's full range. P3-7 once suspected this range of causing `auc_3px = 0`; P1-1a settled that it was not (§3) |
 | preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured the polarity as non-optimal on 3 of 4 datasets** and it stays anyway — see below. **Stage C measured the ×1** and it is the right factor, so the two halves of this row carry opposite caveats |
 | estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default, **and the one field stage D measured and left where it was** (P3-10 F33/F35): MAGSAC is best or tied on the failure-inclusive metric in 15 of 16 (matcher, dataset) cells, and its own threshold row is flat inside the seed noise, so the 3 px is a free choice rather than a tuned one. Frozen for stages E-G on that basis. The 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
-| warp model | homography | **the only one that can reach zero error against this ground truth**, which P3-4a turned from an implementation fact into a measured one. Tier-1 samples a projective warp, so the restricted models carry a floor: on a 640-wide set the best possible affine is **11.47 px** and the best possible similarity **15.77 px** (P3-4a F40). The anchor is the only cell of the axis that is not floored above the reporting ladder |
+| warp model | homography | **the only one that can reach zero error against this ground truth**, which P3-4a turned from an implementation fact into a measured one. Tier-1 samples a projective warp, so the restricted models carry a floor: on a 640-wide set the best possible affine is **11.17 px** and the best possible similarity **15.57 px** (P3-4a F40, corrected by F45). The anchor is the only cell of the axis that is not floored above the reporting ladder |
 | `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
 | seed | 0 | one seed outside stage D; see §5 |
 
@@ -38,11 +38,20 @@ stage-A number with this caveat, and never as evidence that inverting the optica
 **The warp model is a third measured field, and it is the least ambiguous of the three**
 (P3-4a F40/F41). The ×1 and the polarity above were measured against matchers; this one needs
 no matcher at all, because the floor is a property of the sampled warp and the image shape. A
-similarity fit can be scored a success at the headline 5 px on at most **0.7%** of 640-wide
-pairs and an affine on **14.7%**, whatever produced it — so the anchor's `homography` is not a
+similarity fit can be scored a success at the headline 5 px on at most **1.0%** of 640-wide
+pairs and an affine on **14.3%**, whatever produced it — so the anchor's `homography` is not a
 default that survived scrutiny but the only entry of the axis that can be scored on this ladder
 at all. The floor is the perspective jitter alone: set `gt.perspective` to 0 and all three
-models floor at exactly 0.00 px.
+models floor at exactly 0.00 px — **except on a composed dataset**, where the residual `R` adds
+a floor of its own (`flir`: 0.17 px affine, 3.61 px similarity, because the constant carries a
+shear and a ~1.4e-6 perspective term no 4-DoF model can represent — P3-4a F46). The floor is
+therefore computed under each cell's own `R` policy, never once per shape.
+
+**Floor a model against the truth the runner *scores*, not against `H_gt`.** The first published
+version of that table floored against the matrix the moving image is warped by rather than
+against `R . inv(H_gt)`. Aggregate effect: under 0.7 px, and no conclusion changed. Per-pair
+effect: Pearson 0.70 / 0.55 between the two directions — which is precisely what stage E's
+per-pair excess column consumes (P3-4a F45).
 
 **The ×1 is the opposite case: measured, and resolved in the anchor's favour** (P3-9 F24/F25).
 Upsampling the thermal side ×3 bicubic — the other half of §15B's recipe — improves 3 of 8
@@ -208,7 +217,7 @@ the only aerial one.
 | B | `invert` on/off, both sides | all 20 | all 4 | 16 | 1 | P3-8 |
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
-| E | homography / affine / similarity (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
+| E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
 | F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
@@ -412,13 +421,14 @@ flow are P3-4b, because they are dense-field-valued and break `PairRow.h`, `corn
 the `R` composition (and `cv2`'s TPS transformer no longer exists in OpenCV 5, so the solver is
 hand-written). A five-column stage E waits for them; a three-column one does not.
 
-**Two match passes, not ten cells.** The warp model is downstream of the matcher exactly as the
-estimator is, so it is a third axis of the same sweep: one match pass per dataset feeds three
-fits per pair. At stage C's measured ~19 min per reduced-8 cell and stage D's measured
-**~3.8 single-variant cells per swept pass** (F38 — a variant is an estimate *and a score*), two
-passes is **~2.5 h**, against ~1.3 h for the six cells taken naively. Sweeping is *not* the
-cheaper option at three variants; it is taken because it removes the matcher as a source of
-between-column difference, which is the whole point of the stage.
+**Two match passes, not six cells.** The warp model is downstream of the matcher exactly as the
+estimator is, so it is a third axis of the same sweep: one match pass per dataset feeds six fits
+per pair (three models × two estimators). Extrapolating stage D's own per-pass breakdown (F38 —
+~13 min matching, ~8 min per vanilla-RANSAC variant, ~2.1 min scoring per variant on
+`dronevehicle`), two passes is **~1.5–1.8 h**, against ~1.3 h for the six cells taken naively,
+and roughly half of it is vanilla RANSAC. Sweeping is *not* the cheaper option at six variants;
+it is taken because it removes the matcher as a source of between-column difference, which is
+the whole point of the stage.
 
 **The estimator cannot be held fixed across the axis** (P3-4a F39). OpenCV fits a 4-DoF
 similarity by RANSAC and LMEDS only — every USAC method, MAGSAC included, raises. So the anchor
@@ -429,14 +439,44 @@ this affordable to interpret: the four estimators sit inside the seed noise on t
 failure-inclusive metric, so a RANSAC-versus-MAGSAC difference is already known to be small —
 but it is *measured* small, not assumed, and the control column is what lets the stage say so.
 
-**The stage's own conclusion is bounded before it runs** (F40). Both restricted models are
-floored above the 5 px headline: their `success_rate_5px` cannot exceed 0.007 and 0.147. So the
+**The stage's own conclusion is bounded before it runs** (F40/F45). Both restricted models are
+floored above the 5 px headline: their `success_rate_5px` cannot exceed 0.010 and 0.143. So the
 stage cannot find that a restricted model wins on the headline threshold, and it should be read
 — and budgeted — as answering a narrower question: *how much of the homography's advantage is the
 extra capacity actually delivering, against how much the ground truth simply hands it?* Report
 every row beside its floor, exactly as GRID.md §3's composed rows are reported beside `R`. If
 the measured gap between a model and its own floor is smaller than the gap between models, the
 axis is reporting the ground truth's perspective content and the paper should say so (X-4).
+
+**Authored 2026-08-31 as `scripts/p3e_warp.py`**, driving `p3a_baseline_grid.yaml` with
+`--sweep-warp-models homography,affine,similarity --sweep-estimators magsac,ransac` at the
+anchor 3 px. Run directories are `runs/stagee_<dataset>`.
+
+    uv run python scripts/p3e_warp.py --device cuda
+
+Four blocks, in the order they print:
+
+1. **`model_table`** — matchers down, warp models across, `mace | success@10px | failure_rate`,
+   one table per estimator. Carries a `FLOOR (mean)` row per column and names the
+   `similarity/magsac` hole out of the rows' own `failure_reason`.
+2. **`excess_block`** — the stage's question, asked **per pair**: each pair's `corner_err` minus
+   *that pair's own* floor, median over pairs then over matchers, beside the median `corner_err`
+   over the same pairs. Not beside `reg/mace`, which is a mean over successes and cannot be
+   subtracted from a paired quantity. The footer prints the fraction of the between-model gap
+   that survives the floor; below 0.5 the sentence above applies. A **negative** excess is free
+   falsification — the floor is a strict lower bound — and prints as `**CHECK**`.
+3. **`control_block`** — MAGSAC against RANSAC on the two models that admit both, once per metric
+   in `AGGREGATE_METRICS` and over `_common_matchers` (stage D's F34 and F37). Read as scoping:
+   one seed, and F33 already bounded every estimator difference by the seed spread.
+4. **`cost_block`** — `time/estimate_ms` per (matcher, model, estimator), never `total_ms`. This
+   is where the RANSAC control column's price is measured rather than extrapolated.
+
+**Per-pair floors, and where they come from.** `p3e_warp.py::floors_for` resolves the cell's own
+config through `cmreg`'s parser, walks `data/splits.py::select_pairs` for the `(split index,
+path)` pairs the run actually scored, and builds each truth with
+`p3_warp_floor.py::scored_truths` — one function, so the floor and the row cannot disagree about
+what "the truth" is. Shapes come from the rows themselves, so a dataset of mixed resolutions
+cannot silently be floored at one. Seconds, no matcher, no GPU.
 
 Stages F and G have unmet preconditions (P2-2's overlap generator, P2-3's degradations) and are
 listed to fix their shape, not to be launched.
@@ -464,6 +504,7 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
 | C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
+| E | reduced-8, 28,800 rows off 4,800 matches | **~1.5-1.8 h projected** (2 swept passes x 6 variants), extrapolated from stage D's per-pass breakdown rather than from a cell rate: ~13 min matching, ~8 min per vanilla-RANSAC variant and ~2.1 min scoring per variant. **Vanilla RANSAC is ~half the bill** and is bought deliberately — it is the only estimator all three models admit, so it is the one column in which the model axis is unconfounded (P3-4a F39). Rewrite this row from `time/estimate_ms` once it has run |
 | D | reduced-8, 288,000 rows off 24,000 matches | **~11 h 10 min, measured** (2026-08-31; 60 min 38 s per `flir` pass, 71–74 min per `dronevehicle` one) against **~4–5 h projected**. The collapse to **10 match passes** was still right — the frozen 120 invocations were ~38 h — but it won ~3.5×, not ~8×: **a swept pass costs ~3.8 single-variant cells**, because the twelve variants are twelve estimate-*and-score* cycles and not twelve `cv2.findHomography` calls. One `dronevehicle` pass is ~13 min matching, ~30 min estimation (~24 of it vanilla RANSAC alone), ~25 min scoring 28,800 rows, ~2 min Parquet and 96 W&B runs. Budget any future stage that sweeps a *scoring* axis at that ratio. Read the estimator's own bill off `time/estimate_ms`, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets

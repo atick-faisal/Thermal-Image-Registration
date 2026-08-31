@@ -251,3 +251,43 @@ def test_the_floor_is_a_lower_bound_on_what_an_estimator_achieves() -> None:
 def test_lift_rejects_a_matrix_that_is_not_two_by_three() -> None:
     with pytest.raises(WarpError, match="2x3"):
         lift(np.eye(3))
+
+
+def test_the_floor_is_not_the_same_against_a_warp_and_against_its_inverse() -> None:
+    """P3-4a F45, and the assertion that would have caught it.
+
+    `eval/runner.py::_load_pair` scores every row against ``inv(H_gt)`` -- what the estimator is
+    asked to recover -- while ``H_gt`` is only what the moving image was *warped by*. The first
+    published floor table (`scripts/p3_warp_floor.py`) floored against ``H_gt``. In aggregate the
+    difference is small enough to hide (11.47 vs 11.17 px mean affine over 300 warps on a
+    640-wide set, and the same conclusion either way), but the two disagree pair by pair --
+    measured Pearson 0.70 for affine and 0.55 for similarity -- so a per-pair excess-over-floor
+    column built on the wrong one is wrong per pair while looking plausible in the mean.
+
+    Pinned as an inequality rather than a value: nothing else in the suite would notice the
+    direction flipping back, and every stage-E row is read against this number.
+    """
+    truth = sample_homography(GTConfig(), generator(0, 7), SHAPE)
+    for model in (WarpModel.AFFINE, WarpModel.SIMILARITY):
+        forward = model_floor(truth, SHAPE, model)
+        inverse = model_floor(np.linalg.inv(truth), SHAPE, model)
+        assert forward > 0.0 and inverse > 0.0
+        assert forward != pytest.approx(inverse, abs=1e-6)
+
+
+def test_composing_a_residual_moves_the_floor_it_is_composed_into() -> None:
+    """A composed dataset's rows are scored against ``R . inv(H_gt)``, so that is what their
+    floor has to be measured against (`experiments/GRID.md` §3, P2-12).
+
+    `R` is not a pure translation -- `calibration/flir.json` carries a shear, a non-uniform scale
+    and a perspective term of ~1.4e-6 -- so composing it changes what each restricted model can
+    represent. Measured on `flir`: it moves an individual pair's similarity floor by up to 4.6 px
+    while barely moving the mean, which is precisely the shape of error a dataset-level check
+    would miss.
+    """
+    truth = np.linalg.inv(sample_homography(GTConfig(), generator(0, 11), SHAPE))
+    composed = AFFINE @ truth
+    for model in (WarpModel.AFFINE, WarpModel.SIMILARITY):
+        assert model_floor(composed, SHAPE, model) != pytest.approx(
+            model_floor(truth, SHAPE, model), abs=1e-6
+        )

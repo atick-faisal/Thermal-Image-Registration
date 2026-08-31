@@ -549,8 +549,17 @@ class EstimateConfig(ConfigBase):
 
     @property
     def label(self) -> str:
-        """This cell's token in a run name, a W&B group and a console table header."""
-        return f"{self.method.value}@{self.threshold_px:g}px"
+        """This cell's token in a run name, a W&B group and a console table header.
+
+        The warp model appears only when it is **not** the default, which is the same rule
+        ``eval/runner.py::_variant_label`` and ``results/report.py::_row_names`` follow: every
+        run before P3-4a was implicitly ``homography``, so naming it unconditionally would
+        rewrite labels that are already pasted into TASKS.md. Stage E (P3-11) is the case that
+        needs it -- its six variants hold the threshold fixed and vary the model, so without the
+        prefix three pairs of them would log under one name.
+        """
+        prefix = "" if self.warp_model is WarpModel.HOMOGRAPHY else f"{self.warp_model.value}/"
+        return f"{prefix}{self.method.value}@{self.threshold_px:g}px"
 
 
 class Config(ConfigBase):

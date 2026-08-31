@@ -11,7 +11,7 @@ Stage E (TASKS.md P3-11) is unreadable without this number. "Affine scores 9 px 
 same argument P3-7's F1 had to make after the fact about `flir`'s 5.9 px -- made here *before*
 the stage is paid for, because unlike `R` this floor costs nothing to measure.
 
-It needs no matcher, no GPU and no dataset: the floor is a property of the sampled warp and the
+It needs no matcher, no GPU and no dataset: the floor is a property of the scored truth and the
 image shape alone, so this runs on the Mac in seconds and is the one part of P3-4a that does not
 wait for the server. Shapes are the four benchmark datasets' native resolutions (GRID.md §7).
 
@@ -21,6 +21,21 @@ wait for the server. Shapes are the four benchmark datasets' native resolutions 
 `--perspective` exists to show the mechanism rather than to propose a change: at 0.0 the sampled
 warp is a similarity and both floors collapse, which is what identifies the perspective jitter
 as the term the restricted models cannot follow.
+
+**The truth this floors against is `inv(H_gt)`, composed with `R` where GRID.md §3 says compose**
+-- not `H_gt`. The first published version of this table floored against `H_gt`, which is what
+the moving image is *warped by*; every row the benchmark scores is measured against what the
+estimator is asked to *recover*, and `eval/runner.py::_load_pair` builds that as
+``truth = R . inv(H_gt)``. In aggregate the correction is small (affine 11.47 -> 11.17 px on a
+640-wide set) and it changes no conclusion, but the two directions agree only weakly *per pair*
+-- Pearson 0.70 for affine and 0.55 for similarity -- so a per-pair excess-over-floor column
+built on the old direction would have been wrong pair by pair while looking entirely plausible
+in aggregate. Recorded as TASKS.md P3-4a F45 and pinned by `tests/test_warp_models.py`.
+
+`model_floor` calls `corner_error` **unsaturated** while the evaluation cell saturates at the
+image diagonal (`metrics/registration.py::corner_error`). At 11-16 px against an ~820 px diagonal
+the clip cannot bind, so the two quantities are directly comparable; said here rather than left
+to be rediscovered when a future stage floors something large.
 """
 
 from __future__ import annotations
@@ -29,12 +44,15 @@ import argparse
 import logging
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from cmreg.config import GTConfig, WarpModel
-from cmreg.gt import generator, sample_homography
+from cmreg.gt import ResidualCalibration, generator, load_calibration, sample_homography
 from cmreg.metrics import model_floor
+from cmreg.warp import FloatArray
+from stages import CELLS
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +65,10 @@ SHAPES: dict[str, tuple[int, int]] = {
     "llvip": (1024, 1280),
 }
 
+# Which datasets compose their residual `R` into the Tier-1 truth, read from `stages.CELLS` --
+# GRID.md §3's policy lives there and a second copy here is a second place for it to drift.
+COMPOSES: dict[str, bool] = {cell.dataset: cell.composes for cell in CELLS}
+
 # The ladder every benchmark row is read against (GRID.md §2), so the floor can be placed on it.
 THRESHOLDS_PX = (3.0, 5.0, 10.0, 20.0)
 
@@ -58,6 +80,10 @@ class Floor:
     dataset: str
     model: WarpModel
     values: np.ndarray
+    # Whether this cell's truth carried the dataset's residual `R`. Reported, because composing
+    # moves an individual pair's floor by up to 4.6 px on `flir` even though it barely moves the
+    # mean -- so an uncomposed floor quoted beside a composed row is a per-pair mismatch.
+    composed: bool
 
     @property
     def mean(self) -> float:
@@ -81,16 +107,65 @@ class Floor:
         return float((self.values < threshold).mean())
 
 
-def measure(dataset: str, shape: tuple[int, int], config: GTConfig, pairs: int) -> list[Floor]:
+def scored_truths(
+    shape: tuple[int, int],
+    config: GTConfig,
+    indices: range | tuple[int, ...],
+    calibration: ResidualCalibration | None,
+) -> list[FloatArray]:
+    """The truths a bench run would score these pair indices against.
+
+    One function so that this script and stage E's driver cannot disagree about what "the
+    truth" is. It reproduces `eval/runner.py::_load_pair` exactly: the warp is keyed on
+    ``(seed, index)``, the truth is its **inverse** -- what the estimator is asked to recover,
+    not what the moving image was warped by -- and a composing dataset left-multiplies `R`.
+    """
+    truths = []
+    for index in indices:
+        homography = sample_homography(config, generator(config.seed, index), shape)
+        truth = np.linalg.inv(homography)
+        if calibration is not None:
+            truth = calibration.homography() @ truth
+        truths.append(truth)
+    return truths
+
+
+def calibration_for(
+    dataset: str, shape: tuple[int, int], compose: bool
+) -> ResidualCalibration | None:
+    """The dataset's residual constant, or ``None`` where GRID.md §3 says not to compose."""
+    if not compose or not COMPOSES.get(dataset, False):
+        return None
+    path = Path("calibration") / f"{dataset}.json"
+    if not path.exists():
+        raise SystemExit(
+            f"{dataset}: GRID.md §3 marks it as composing its residual but {path} is missing. "
+            f"Produce it with `uv run python scripts/p3b_calibrate.py --datasets {dataset}`, "
+            "or pass --no-compose to floor against the uncomposed truth."
+        )
+    record = load_calibration(path)
+    record.validate_for(dataset, shape)
+    return record
+
+
+def measure(
+    dataset: str, shape: tuple[int, int], config: GTConfig, pairs: int, compose: bool = True
+) -> list[Floor]:
     """Sample `pairs` ground-truth warps for one dataset and floor each model against them.
 
     The warps come from `sample_homography` under the real `GTConfig`, keyed on `(seed, index)`
     exactly as the runner keys them -- so these are the warps a bench run on this dataset would
     actually score against, not a re-derivation that could drift from them.
     """
-    warps = [sample_homography(config, generator(config.seed, i), shape) for i in range(pairs)]
+    calibration = calibration_for(dataset, shape, compose)
+    truths = scored_truths(shape, config, range(pairs), calibration)
     return [
-        Floor(dataset, model, np.array([model_floor(h, shape, model) for h in warps]))
+        Floor(
+            dataset,
+            model,
+            np.array([model_floor(t, shape, model) for t in truths]),
+            composed=calibration is not None,
+        )
         for model in WarpModel
     ]
 
@@ -104,13 +179,18 @@ def render(floors: list[Floor]) -> str:
         "A strict lower bound: fitted to the four corners, which minimises the very quantity",
         "`reg/mace` reports, so no matcher on any correspondence set can score below it.",
         "",
-        f"{'dataset':<14}{'model':<13}{'mean':>8}{'median':>9}{'p90':>9}"
+        "Floored against the truth the runner SCORES, `R . inv(H_gt)` -- not against `H_gt`,",
+        "which is only what the moving image is warped by (F45). `R` composed where GRID.md",
+        "§3 says compose, marked in the `truth` column.",
+        "",
+        f"{'dataset':<14}{'model':<13}{'truth':<14}{'mean':>8}{'median':>9}{'p90':>9}"
         + "".join(f"{f'<{t:g}px':>10}" for t in THRESHOLDS_PX),
     ]
     lines.append("-" * len(lines[-1]))
     for floor in floors:
+        truth = "R.inv(H_gt)" if floor.composed else "inv(H_gt)"
         lines.append(
-            f"{floor.dataset:<14}{floor.model.value:<13}"
+            f"{floor.dataset:<14}{floor.model.value:<13}{truth:<14}"
             f"{floor.mean:>8.2f}{floor.median:>9.2f}{floor.p90:>9.2f}"
             + "".join(f"{floor.below(t):>10.3f}" for t in THRESHOLDS_PX)
         )
@@ -128,12 +208,17 @@ def main_script(argv: list[str] | None = None) -> int:
         default=None,
         help="override GTConfig.perspective; 0.0 collapses the truth to a similarity",
     )
+    parser.add_argument(
+        "--no-compose",
+        dest="compose",
+        action="store_false",
+        help="floor against the uncomposed truth everywhere, ignoring GRID.md §3's policy",
+    )
     args = parser.parse_args(argv)
 
-    overrides = {"seed": args.seed}
+    config = GTConfig(seed=args.seed)
     if args.perspective is not None:
-        overrides["perspective"] = args.perspective
-    config = GTConfig(**overrides)
+        config = config.model_copy(update={"perspective": args.perspective})
     logger.info(
         "flooring %d warps per dataset at rotation +/-%.0f deg, scale %.2f-%.2f, "
         "perspective %.3f, translation %.3f",
@@ -148,7 +233,7 @@ def main_script(argv: list[str] | None = None) -> int:
     floors = [
         floor
         for dataset, shape in SHAPES.items()
-        for floor in measure(dataset, shape, config, args.pairs)
+        for floor in measure(dataset, shape, config, args.pairs, args.compose)
     ]
     print(render(floors))
     return 0

@@ -37,6 +37,16 @@ P0-2) -- and it is in `reduced-8`. Those cells are recorded as
 `estimator_needs_confidence` rows rather than aborting the run that eleven other variants
 depend on, and they print as `--` here. Stated in every table it touches (X-4).
 
+**Two metrics, both aggregated.** Amended after the 2026-08-31 run, from its own output. The
+per-estimator tables always carried `reg/mace` and `reg/success_rate_10px` side by side, but the
+two aggregate blocks reduced the first only -- and the first is a mean over *successes*, so LMEDS
+leaving a third of the pairs unsolved read as a fourfold accuracy win over MAGSAC on `dronevehicle`
+while it was in fact losing to it on the success rate for seven of eight matchers (TASKS.md
+F33/F34). Both blocks are now rendered once per metric, cells carry the failure rate that makes
+the two disagree, and cross-estimator medians run over `_common_matchers` rather than over
+whatever each estimator happened to have (F37). Re-running this script on a server whose ten run
+directories are already complete re-renders every block from Parquet without matching anything.
+
 Needs a GPU; `--device cpu` with the dry-run overrides is how the plumbing is proved before the
 trip. Every block it prints is meant to be copied out of the console whole.
 """
@@ -50,7 +60,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from cmreg.metrics.schema import MACE, N_PAIRS, TIME_ESTIMATE_MS, success_rate_key
+from cmreg.metrics.schema import FAILURE_RATE, MACE, N_PAIRS, TIME_ESTIMATE_MS, success_rate_key
 from cmreg.results import PairRow
 from stages import CELLS, CONFIG, REDUCED_8, Cell, DryRun, run_cell
 
@@ -60,6 +70,23 @@ from stages import CELLS, CONFIG, REDUCED_8, Cell, DryRun, run_cell
 HEADLINE = MACE
 SECONDARY_THRESHOLD = 10.0
 SECONDARY = success_rate_key(SECONDARY_THRESHOLD)
+
+# **Both of them lead in the aggregate blocks, and stage D's own output is why.** `reg/mace`
+# is a mean over *successes only* while `reg/success_rate_10px` counts a failed pair as
+# infinite error (`results/report.py:75`), so an estimator that declines the pairs it cannot
+# solve buys the first with the second. LMEDS does exactly that here -- 4x the median mace of
+# MAGSAC on `dronevehicle` while losing to it on the success rate for seven of eight matchers
+# (TASKS.md F34). Blocks 2 and 3 are therefore rendered once per metric: read on mace alone,
+# this stage's axis reads backwards.
+AGGREGATE_METRICS = (HEADLINE, SECONDARY)
+
+# Two decimals for a pixel error, four for a rate: the estimator differences in the success
+# rate live in the third decimal, and `.2f` would print several of the twelve cells identical.
+_RATE_METRICS = (SECONDARY, FAILURE_RATE)
+
+# `mace | success | failure` is 21 characters at this project's widest cell (`sift` on
+# `dronevehicle`, 517.27 px); 24 keeps a gap between columns.
+_CELL_WIDTH = 24
 
 # GRID.md §6's `driving+aerial`: the best-characterised driving set and the only aerial one.
 DATASETS = ("flir", "dronevehicle")
@@ -194,12 +221,81 @@ def _mean_over_seeds(series: Series, key: tuple[str, float, str], metric: str) -
 
 
 def _cell_text(series: Series, key: tuple[str, float, str]) -> str:
+    """`mace | success@10px | failure rate`, for one cell.
+
+    The failure rate rides along rather than living in a block of its own because the first two
+    numbers only disagree when it moves, and reading that off two separate tables is how this
+    stage was nearly recorded backwards (TASKS.md F34).
+    """
     if key not in series:
         return "--"
     mace = _mean_over_seeds(series, key, HEADLINE)
     if math.isnan(mace):
         return "--"
-    return f"{mace:.2f} | {_mean_over_seeds(series, key, SECONDARY):.3f}"
+    return (
+        f"{mace:.2f} | {_mean_over_seeds(series, key, SECONDARY):.3f}"
+        f" | {_mean_over_seeds(series, key, FAILURE_RATE):.2f}"
+    )
+
+
+def _short(metric: str) -> str:
+    """`reg/success_rate_10px` -> `success_rate_10px`, for a column header that has to fit."""
+    return metric.split("/")[-1]
+
+
+def _fmt(metric: str, value: float) -> str:
+    return f"{value:.4f}" if metric in _RATE_METRICS else f"{value:.2f}"
+
+
+def _common_matchers(series: Series) -> list[str]:
+    """The matchers *every* estimator produced geometry for.
+
+    Every cross-estimator aggregate below is taken over this set rather than over each
+    estimator's own matchers, and stage D is the reason. `xfeat` returns no per-match confidence
+    and so has no PROSAC cell (P0-2), which made the printed median a median over seven matchers
+    for PROSAC and over eight for the other three -- and dropping the second-worst matcher lifts
+    it. On `flir` that inverted the result: `magsac@3px` 13.13 px against `prosac@3px` 11.01 as
+    printed, 10.49 against 11.01 over the common seven (TASKS.md F37).
+
+    Applicability is read off `reg/mace` whichever metric is being aggregated. A cell that solved
+    no pair at all has no mace, while `reg/success_rate_10px` still reads 0.0 there -- a real
+    number meaning "never ran", and averaging it in would charge an estimator for a matcher it
+    could not be run against.
+    """
+    return [
+        matcher
+        for matcher in _matchers_in(series)
+        if all(
+            any(
+                not math.isnan(_mean_over_seeds(series, (estimator, threshold, matcher), HEADLINE))
+                for threshold in THRESHOLDS
+            )
+            for estimator in ESTIMATORS
+        )
+    ]
+
+
+def _excluded_note(all_series: dict[str, Series]) -> str | None:
+    """Name the matchers `_common_matchers` dropped, out of the run's own numbers.
+
+    Over every dataset at once: the blocks that carry this note render all of them, and a note
+    naming only the first dataset's exclusions would be a footnote that does not cover its table.
+    """
+    absent = list(
+        dict.fromkeys(
+            matcher
+            for series in all_series.values()
+            for matcher in _matchers_in(series)
+            if matcher not in _common_matchers(series)
+        )
+    )
+    if not absent:
+        return None
+    return (
+        f"# medians are over the matchers every estimator solved; {', '.join(absent)} excluded, "
+        "since a median\n#   over a different matcher set per estimator compares two "
+        "populations (F37)."
+    )
 
 
 def _scored(series: Series) -> int:
@@ -247,13 +343,15 @@ def estimator_table(cell: Cell, estimator: str, series: Series, rows: Rows, seed
         return ""
     width = max(len("matcher"), *(len(name) for name in matchers)) + 2
     composed = "composed" if cell.composes else "a floor, not an accuracy"
-    header = f"{'matcher':<{width}}" + "".join(f"{f'{t:g}px':>22}" for t in THRESHOLDS)
+    header = f"{'matcher':<{width}}" + "".join(f"{f'{t:g}px':>{_CELL_WIDTH}}" for t in THRESHOLDS)
     lines = [
         f"=== CMREG STAGE D: {cell.dataset} / {estimator} ({composed}) -- {HEADLINE} px | "
-        f"{SECONDARY} ===",
+        f"{SECONDARY} | {FAILURE_RATE} ===",
         f"# pairs scored: {_scored(series)}, mean over {seeds} seeds. columns are the "
         "estimator's INLIER threshold,",
         "#   which is unrelated to the reporting ladder the success rate is read at.",
+        "# mace is a mean over SUCCESSES; the success rate counts a failure as infinite error.",
+        "#   The third number is the failure rate, and it is what makes the first two disagree.",
     ]
     if note := _unsupported_note(rows, estimator):
         lines.append(note)
@@ -268,45 +366,57 @@ def estimator_table(cell: Cell, estimator: str, series: Series, rows: Rows, seed
         )
     lines += [header, "-" * len(header)]
     for matcher in matchers:
-        cells = "".join(f"{_cell_text(series, (estimator, t, matcher)):>22}" for t in THRESHOLDS)
+        cells = "".join(
+            f"{_cell_text(series, (estimator, t, matcher)):>{_CELL_WIDTH}}" for t in THRESHOLDS
+        )
         lines.append(f"{matcher:<{width}}{cells}")
     lines.append("=== END ===")
     return "\n".join(lines)
 
 
-def seed_block(all_series: dict[str, Series], seeds: tuple[int, ...]) -> str:
-    """Does any estimator difference clear its own seed-to-seed noise?
+def seed_block(all_series: dict[str, Series], seeds: tuple[int, ...], metric: str) -> str:
+    """Does any estimator difference clear its own seed-to-seed noise, on one metric?
 
     The block the five seeds exist for, and the one that decides whether stage D has a finding
-    or a flat row. Medians over matchers throughout: `mace` spans 7-900 px across this project's
-    matcher list, and one classical failure would otherwise set the statistic (P3-9's practice).
+    or a flat row. Rendered once per entry in `AGGREGATE_METRICS`, because on this stage the two
+    entries answer it differently: an estimator that declines the pairs it cannot solve shrinks
+    a mean over successes and shrinks the success rate with it, so `reg/mace` alone reads the
+    axis backwards (TASKS.md F33/F34).
+
+    Medians over matchers throughout: `mace` spans 7-900 px across this project's matcher list,
+    and one classical failure would otherwise set the statistic (P3-9's practice). Over
+    `_common_matchers`, so that the twelve cells are medians of the same population.
 
     The interval is a Student-t one at n=5 and is the only assumption in this file; the seed
     *spread* beside it is assumption-free, and where the two disagree the spread is the one to
     believe.
     """
-    header = f"{'dataset':<16}{'cell':>16}{'median mace':>14}{'+-95% CI':>12}{'seed spread':>14}"
+    label = f"median {_short(metric)}"
+    column = max(len(label), 12) + 2
+    header = f"{'dataset':<16}{'cell':>16}{label:>{column}}{'+-95% CI':>12}{'seed spread':>14}"
     lines = [
-        "=== CMREG STAGE D: is the estimator axis bigger than the seed noise? ===",
+        f"=== CMREG STAGE D: is the estimator axis bigger than the seed noise? [{metric}] ===",
         f"# over {len(seeds)} seeds ({', '.join(str(s) for s in seeds)}), median over the "
         "matchers of each statistic.",
         "# CI is Student-t at n=5 on the per-seed means -- an assumption; `seed spread`",
         "#   (max - min across seeds) is not. Read the spread first.",
         "# FOOTER is the finding: an axis whose best-to-worst range is inside the seed spread",
         "#   has not measured anything, and X-4 says that is a row to report, not to hide.",
-        header,
-        "-" * len(header),
     ]
+    if note := _excluded_note(all_series):
+        lines.append(note)
+    lines += [header, "-" * len(header)]
     for dataset, series in all_series.items():
+        matchers = _common_matchers(series)
         levels: dict[tuple[str, float], float] = {}
         for estimator in ESTIMATORS:
             for threshold in THRESHOLDS:
                 means, spreads, intervals = [], [], []
-                for matcher in _matchers_in(series):
+                for matcher in matchers:
                     values = [
-                        m[HEADLINE]
+                        m[metric]
                         for m in series.get((estimator, threshold, matcher), [])
-                        if not math.isnan(m[HEADLINE])
+                        if not math.isnan(m[metric])
                     ]
                     if not values:
                         continue
@@ -322,15 +432,16 @@ def seed_block(all_series: dict[str, Series], seeds: tuple[int, ...]) -> str:
                 level = statistics.median(means)
                 levels[estimator, threshold] = level
                 interval = [v for v in intervals if not math.isnan(v)]
+                spread = statistics.median(interval) if interval else float("nan")
                 lines.append(
-                    f"{dataset:<16}{f'{estimator}@{threshold:g}px':>16}{level:>14.2f}"
-                    f"{statistics.median(interval) if interval else float('nan'):>12.2f}"
-                    f"{statistics.median(spreads):>14.2f}"
+                    f"{dataset:<16}{f'{estimator}@{threshold:g}px':>16}"
+                    f"{_fmt(metric, level):>{column}}{_fmt(metric, spread):>12}"
+                    f"{_fmt(metric, statistics.median(spreads)):>14}"
                 )
         if len(levels) > 1:
             lines.append(
                 f"{dataset:<16}{'-> best-worst':>16}"
-                f"{max(levels.values()) - min(levels.values()):>14.2f}"
+                f"{_fmt(metric, max(levels.values()) - min(levels.values())):>{column}}"
                 f"{'  (compare against the seed spread column above)':>26}"
             )
     lines.append("=== END ===")
@@ -342,12 +453,17 @@ def _spread(values: list[float]) -> float | None:
     return max(present) - min(present) if len(present) > 1 else None
 
 
-def axis_block(all_series: dict[str, Series]) -> str:
+def axis_block(all_series: dict[str, Series], metric: str) -> str:
     """Which of the two axes carries the effect -- the estimator, or its threshold?
 
     The direct analogue of stage C's `axis_block`, and what settles the estimator and threshold
     for stages E-G. A threshold spread that is small against the estimator spread means the
     threshold is a free choice; ~1 means the paper has to report both.
+
+    Rendered once per entry in `AGGREGATE_METRICS` for the reason `seed_block` gives, and the
+    ratio is the place it showed most: stage D's aerial ratio is 5.59 on `reg/mace` and 2.12 on
+    `reg/success_rate_10px`, because most of what the mace ratio measures is LMEDS declining
+    pairs rather than registering them better (TASKS.md F33/F34).
 
     LMEDS is excluded from the *threshold* spread rather than left in: it ignores the threshold
     by construction, so including it would dilute that axis with three copies of one number and
@@ -356,31 +472,37 @@ def axis_block(all_series: dict[str, Series]) -> str:
     responsive = [e for e in ESTIMATORS if e != FIT_THRESHOLD_BLIND]
     header = f"{'dataset':<16}{'across estimators':>20}{'across thresholds':>20}{'ratio':>10}"
     lines = [
-        "=== CMREG STAGE D: does the estimator matter, or only its threshold? ===",
-        "# medians of the mace spread, over the matchers, on the seed-averaged values.",
+        f"=== CMREG STAGE D: does the estimator matter, or only its threshold? [{metric}] ===",
+        f"# medians of the {_short(metric)} spread, over the matchers, on the seed-averaged "
+        "values.",
         "# across estimators = spread over the four estimators at a fixed threshold.",
         f"# across thresholds = spread over 1/3/5 px at a fixed estimator, "
         f"{FIT_THRESHOLD_BLIND} excluded (it ignores the threshold).",
         "# ratio = estimators / thresholds. Large means the estimator is the axis and the",
         "#   threshold is a free choice for stages E-G; ~1 means both have to be reported.",
-        header,
-        "-" * len(header),
     ]
+    if note := _excluded_note(all_series):
+        lines.append(note)
+    lines += [header, "-" * len(header)]
     for dataset, series in all_series.items():
         over_estimators: list[float] = []
         over_thresholds: list[float] = []
+        # The estimator spread is a cross-estimator statistic and so runs over the common
+        # matchers; the threshold spread is taken inside one estimator and does not have to.
+        common = _common_matchers(series)
         for matcher in _matchers_in(series):
-            for threshold in THRESHOLDS:
-                values = [
-                    _mean_over_seeds(series, (e, threshold, matcher), HEADLINE)
-                    for e in ESTIMATORS
-                    if (e, threshold, matcher) in series
-                ]
-                if (spread := _spread(values)) is not None:
-                    over_estimators.append(spread)
+            if matcher in common:
+                for threshold in THRESHOLDS:
+                    values = [
+                        _mean_over_seeds(series, (e, threshold, matcher), metric)
+                        for e in ESTIMATORS
+                        if (e, threshold, matcher) in series
+                    ]
+                    if (spread := _spread(values)) is not None:
+                        over_estimators.append(spread)
             for estimator in responsive:
                 values = [
-                    _mean_over_seeds(series, (estimator, t, matcher), HEADLINE)
+                    _mean_over_seeds(series, (estimator, t, matcher), metric)
                     for t in THRESHOLDS
                     if (estimator, t, matcher) in series
                 ]
@@ -393,7 +515,8 @@ def axis_block(all_series: dict[str, Series]) -> str:
         threshold_spread = statistics.median(over_thresholds)
         ratio = estimator_spread / threshold_spread if threshold_spread > 0.0 else float("inf")
         lines.append(
-            f"{dataset:<16}{estimator_spread:>20.2f}{threshold_spread:>20.2f}{ratio:>10.2f}"
+            f"{dataset:<16}{_fmt(metric, estimator_spread):>20}"
+            f"{_fmt(metric, threshold_spread):>20}{ratio:>10.2f}"
         )
     lines.append("=== END ===")
     return "\n".join(lines)
@@ -575,12 +698,13 @@ def main_script(argv: list[str] | None = None) -> int:
                 print()
                 print(block, flush=True)
     if all_series:
-        for block in (
-            seed_block(all_series, seeds),
-            axis_block(all_series),
+        blocks = [
+            *(seed_block(all_series, seeds, metric) for metric in AGGREGATE_METRICS),
+            *(axis_block(all_series, metric) for metric in AGGREGATE_METRICS),
             integrity_block(all_rows),
             cost_block(all_series),
-        ):
+        ]
+        for block in blocks:
             print()
             print(block, flush=True)
     print("\n########## DONE -- copy every block above ##########", flush=True)

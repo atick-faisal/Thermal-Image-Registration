@@ -19,7 +19,7 @@ file and the axis named in it.
 | moving / reference | thermal / optical | the production direction (PLAN.md §15B); thermal is the harder, lower-resolution side and warping optical instead flatters every number |
 | Tier-1 warp | ±30°, scale 0.8–1.25 log-uniform, perspective 0.05, translation 0.05 | PLAN.md §5's full range. P3-7 once suspected this range of causing `auc_3px = 0`; P1-1a settled that it was not (§3) |
 | preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured the polarity as non-optimal on 3 of 4 datasets** and it stays anyway — see below. **Stage C measured the ×1** and it is the right factor, so the two halves of this row carry opposite caveats |
-| estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default; the 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
+| estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default, **and the one field stage D measured and left where it was** (P3-10 F33/F35): MAGSAC is best or tied on the failure-inclusive metric in 15 of 16 (matcher, dataset) cells, and its own threshold row is flat inside the seed noise, so the 3 px is a free choice rather than a tuned one. Frozen for stages E-G on that basis. The 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
 | warp model | homography | the only one implemented (P3-4 adds the rest, and is stage E's precondition) |
 | `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
 | seed | 0 | one seed outside stage D; see §5 |
@@ -161,6 +161,13 @@ P0-9). Stage D's five seeds measure those, which is still the interval X-3 asks 
 what P8-2's Wilcoxon needs, so the budget does not change -- only the sentence justifying it.
 Any *claim* of the form "A beats B" gets its five seeds before it enters the paper; a scoping
 row does not.
+
+**What the five bought, now that they have run.** The seed *spread* is the column stage D's
+finding is read against, and it is what turned MAGSAC's threshold row from "small" into "flat":
+2.45-3.67 px on `flir`, against a 0.05-0.17 px range across 1/3/5 px for the three RoMa
+variants (P3-10 F35). An axis inside that spread has not measured anything, which is a row to report
+under X-4 rather than a disappointment. The interval is also what a "MAGSAC beats RANSAC" claim
+needs before P8-2's Wilcoxon can be run on it.
 
 That same determinism is what makes stage D affordable at all (§6): twelve estimator variants
 taken off one `MatchResult` are order-independent, and therefore the same experiment as twelve
@@ -307,7 +314,8 @@ and the §7 rewrite.
 `estimate_homography(..., config.estimate, ...)` at `eval/runner.py:366` — is downstream of the
 matcher, so re-running a matcher per estimator is re-running RoMa twelve times to change a
 RANSAC threshold (~38 h). One match pass per (dataset, seed) feeding twelve estimator calls is
-~4–5 h. The seeds do need re-matching: `config.gt.seed` draws the synthetic warp and `seed_cell`
+~4–5 h — **measured at ~11 h**, still a 3.5× saving but not the 8× projected, because a variant
+is an estimate *and a score* (§7). The seeds do need re-matching: `config.gt.seed` draws the synthetic warp and `seed_cell`
 seeds the matcher's own sampling. `PairRow` already carries `estimator` and `threshold_px`, so
 the store needs nothing; the `config_hash`/resume semantics of a directory holding twelve
 variants is the open question, and P3-10 records it.
@@ -374,6 +382,17 @@ aggregate check would have read the lost pairs as a violation and been wrong. It
 LMEDS is identical and every other estimator is not; every estimator flat would be PLAN.md
 §15A's bug -- a swept knob that never reaches the solver -- in this stage's shape.
 
+**What it settled, 2026-08-31** (TASKS.md P3-10 F33-F38). MAGSAC @ 3 px stays the anchor, now
+on measured grounds. The estimator axis is real on `reg/mace` and nearly absent on the metric
+that counts failures, and the gap between those two readings is the finding: LMEDS trades a
+fifth of its pairs for a mean over the ones it kept. Vanilla RANSAC is dominated on accuracy and
+costs more than the whole matching bill. Two corrections came out of the stage's own output and
+are worth carrying into stages E-G's drivers: **aggregate blocks are rendered once per metric**,
+never on a success-conditioned mean alone, and **cross-estimator medians run over the matchers
+every arm has** -- `xfeat` having no PROSAC cell shifted the printed median enough to invert the
+MAGSAC/PROSAC ordering on `flir` (F37). Both now live in `scripts/p3d_estimator.py` and are
+pinned in `tests/test_grid_driver.py::TestStageD`.
+
 Stages E, F and G have unmet preconditions (P3-4's warp models, P2-2's overlap generator,
 P2-3's degradations) and are listed to fix their shape, not to be launched.
 
@@ -400,7 +419,7 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
 | C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
-| D | reduced-8, ~36,000 rows × 12 variants | **~4–5 h projected**, not the ~38 h the frozen 120 invocations imply: the estimator axis is downstream of the matcher, so the stage is **10 match passes** (2 datasets × 5 seeds) feeding twelve estimator calls each. See §6. The twelve variants add `time/estimate_ms` and nothing else — read the stage's bill off that column, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
+| D | reduced-8, 288,000 rows off 24,000 matches | **~11 h 10 min, measured** (2026-08-31; 60 min 38 s per `flir` pass, 71–74 min per `dronevehicle` one) against **~4–5 h projected**. The collapse to **10 match passes** was still right — the frozen 120 invocations were ~38 h — but it won ~3.5×, not ~8×: **a swept pass costs ~3.8 single-variant cells**, because the twelve variants are twelve estimate-*and-score* cycles and not twelve `cv2.findHomography` calls. One `dronevehicle` pass is ~13 min matching, ~30 min estimation (~24 of it vanilla RANSAC alone), ~25 min scoring 28,800 rows, ~2 min Parquet and 96 W&B runs. Budget any future stage that sweeps a *scoring* axis at that ratio. Read the estimator's own bill off `time/estimate_ms`, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget

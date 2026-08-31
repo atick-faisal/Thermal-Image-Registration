@@ -9,6 +9,7 @@ the new banner. Nothing in the pasted console said so.
 
 from __future__ import annotations
 
+import statistics
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ import p3_stageb_polarity  # on the path via `[tool.pytest.ini_options] pythonpa
 import p3c_upsample
 import p3d_estimator
 import stages
+from cmreg.metrics.schema import FAILURE_RATE
 from cmreg.results import write_rows
 from tests.test_results import make_row
 
@@ -316,6 +318,47 @@ class TestStageD:
         # One pair solved at all three thresholds, not two: the 1 px column lost the other.
         assert line[2:4] == ["1", "1"], line
 
+    def test_a_median_over_matchers_is_not_shifted_by_an_estimator_that_lacks_one(self) -> None:
+        """F37, at fixture scale. `xfeat` has no PROSAC cell, so a median over "whatever this
+        estimator has" is a median over seven matchers for PROSAC and eight for the rest --
+        and on `flir` that reversed the ordering against MAGSAC. The fixture is built so the
+        naive median reverses it too, and the assertion is that the block does not.
+        """
+        series = _estimator_series(
+            {
+                "magsac": {"m1": 10.0, "m2": 11.0, "m3": 20.0, "m4": 40.0},
+                "prosac": {"m1": 12.0, "m2": 13.0, "m3": 21.0},
+            }
+        )
+        # PROSAC is worse than MAGSAC on every matcher they share, and the naive median says
+        # otherwise purely because dropping `m4` moves which value sits in the middle.
+        assert statistics.median([10.0, 11.0, 20.0, 40.0]) > statistics.median([12.0, 13.0, 21.0])
+
+        assert p3d_estimator._common_matchers(series) == ["m1", "m2", "m3"]
+        block = p3d_estimator.seed_block({"flir": series}, (0,), p3d_estimator.HEADLINE)
+        assert _level_for(block, "magsac@1px") < _level_for(block, "prosac@1px")
+        assert "m4 excluded" in block
+
+    def test_an_estimator_that_buys_mace_by_declining_pairs_ranks_last_on_the_success_block(
+        self,
+    ) -> None:
+        """Why both metrics are printed (F33/F34). `reg/mace` is a mean over successes and
+        `reg/success_rate_10px` counts a failure as infinite error, so an estimator that
+        declines the pairs it cannot solve leads the first block and trails the second. Stage D
+        was nearly recorded off the first alone.
+        """
+        series = _estimator_series(
+            {
+                "magsac": {"m1": 60.0, "m2": 62.0, "m3": 64.0},
+                "lmeds": {"m1": 14.0, "m2": 15.0, "m3": 16.0},
+            },
+            success={"magsac": 0.70, "lmeds": 0.60},
+        )
+        mace = p3d_estimator.seed_block({"flir": series}, (0,), p3d_estimator.HEADLINE)
+        rate = p3d_estimator.seed_block({"flir": series}, (0,), p3d_estimator.SECONDARY)
+        assert _level_for(mace, "lmeds@1px") < _level_for(mace, "magsac@1px")
+        assert _level_for(rate, "lmeds@1px") < _level_for(rate, "magsac@1px")
+
 
 def _line_for(block: str, estimator: str) -> list[str]:
     """The data row for one estimator -- matched on the dataset column, because the block's
@@ -340,6 +383,39 @@ def _argv_for(cell: stages.Cell) -> list[str]:
     finally:
         p3d_estimator.run_cell = original
     return captured[0]
+
+
+def _estimator_series(
+    mace: dict[str, dict[str, float]], success: dict[str, float] | None = None
+) -> p3d_estimator.Series:
+    """One dataset's summarised cells, flat across the threshold axis.
+
+    Every estimator named in `mace` carries the matchers given for it and no others, which is
+    how a cell absent for one estimator alone -- `xfeat` under PROSAC -- is expressed. Estimators
+    not named carry the first entry's numbers, so a block that iterates all four still renders.
+    """
+    rates = success or {}
+    default = next(iter(mace.values()))
+    series: p3d_estimator.Series = {}
+    for estimator in p3d_estimator.ESTIMATORS:
+        values = mace.get(estimator, default)
+        for threshold in p3d_estimator.THRESHOLDS:
+            for matcher, value in values.items():
+                series[estimator, threshold, matcher] = [
+                    {
+                        p3d_estimator.HEADLINE: value,
+                        p3d_estimator.SECONDARY: rates.get(estimator, 0.5),
+                        FAILURE_RATE: 0.0,
+                        "reg/n_pairs": 300.0,
+                    }
+                ]
+    return series
+
+
+def _level_for(block: str, cell: str) -> float:
+    """The level column of one `estimator@threshold` row of a `seed_block`."""
+    (line,) = [row for row in block.splitlines() if row.startswith("flir") and cell in row]
+    return float(line.split()[2])
 
 
 def _estimator_rows(magsac_moves: bool = True) -> p3d_estimator.Rows:

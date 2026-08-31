@@ -166,7 +166,10 @@ row does not.
 finding is read against, and it is what turned MAGSAC's threshold row from "small" into "flat":
 2.45-3.67 px on `flir`, against a 0.05-0.17 px range across 1/3/5 px for the three RoMa
 variants (P3-10 F35). An axis inside that spread has not measured anything, which is a row to report
-under X-4 rather than a disappointment. The interval is also what a "MAGSAC beats RANSAC" claim
+under X-4 rather than a disappointment. The same column on the failure-inclusive metric is what
+sizes the estimator axis itself: 0.0233-0.0533 on `flir` and 0.0233-0.0400 on `dronevehicle`,
+against a 0.0233 / 0.0374 range over the four estimators at their best thresholds (F33). The four
+are inside the noise; only the 1 px column is outside it. The interval is also what a "MAGSAC beats RANSAC" claim
 needs before P8-2's Wilcoxon can be run on it.
 
 That same determinism is what makes stage D affordable at all (§6): twelve estimator variants

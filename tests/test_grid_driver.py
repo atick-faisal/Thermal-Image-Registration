@@ -537,7 +537,46 @@ class TestStageE:
         three matchers with one over four."""
         series = _warp_series({"homography": 5.0}, per_matcher={"affine": {"m1": 9.0, "m2": 10.0}})
         assert p3e_warp._common_matchers(series) == ["m1", "m2"]
-        assert "m3 excluded" in p3e_warp.control_block({"flir": series}, p3e_warp.HEADLINE)
+        block = p3e_warp.control_block({"flir": series}, {"flir": _warp_rows()}, p3e_warp.HEADLINE)
+        assert "m3 excluded" in block
+
+    def test_the_control_block_does_not_score_an_estimator_that_never_ran(self) -> None:
+        """F47, found in the stage's own server output. `reg/mace` is NaN for a cell with no
+        successes, so filtering on the aggregated metric hid this on the headline table -- but
+        `reg/success_rate_10px` reads a truthful 0.0 for `similarity/magsac`, and the block
+        printed `magsac 0.0000 | ransac 0.0633 | delta -0.0633` about an estimator OpenCV
+        cannot fit at all. The predicate has to be the capability gap, not the metric's value."""
+        series, rows = _warp_series({"homography": 5.0}), _warp_rows()
+        for metric in p3e_warp.AGGREGATE_METRICS:
+            block = p3e_warp.control_block({"flir": series}, {"flir": rows}, metric)
+            (row,) = [line for line in block.splitlines() if line.split()[1:2] == ["similarity"]]
+            magsac, ransac, delta = row.split()[2:5]
+            assert magsac == "--", f"{metric}: magsac scored on a model it cannot fit"
+            assert delta == "--", f"{metric}: a delta against an estimator that never ran"
+            assert ransac != "--"
+
+    def test_one_raised_pair_does_not_disguise_a_cell_opencv_cannot_fit(self) -> None:
+        """F47's second half, also from the server output. `run_benchmark` catches per *pair*,
+        not per variant, so a pair whose fit raises discards every variant of that
+        (pair, matcher) -- including the `estimator_unsupported_for_warp` rows already built for
+        it. Three such pairs out of 300 made an `all`-quantified predicate report `similarity`
+        as supported, which printed a 0.00 ms cost and dropped the note explaining the `--`."""
+        rows = _warp_rows()
+        key = ("similarity", "magsac", "m1")
+        rows[key] = [
+            make_row(
+                "raised",
+                matcher="m1",
+                warp="similarity",
+                estimator="magsac",
+                success=False,
+                failure_reason="estimator_failed",
+            ),
+            *rows[key][1:],
+        ]
+        assert p3e_warp._is_unsupported(rows, key)
+        note = p3e_warp._unsupported_note(rows, "magsac")
+        assert note is not None and "similarity" in note
 
     def test_a_cell_opencv_cannot_fit_is_not_reported_as_the_cheapest_one(self) -> None:
         """`estimator_unsupported_for_warp` rows carry `estimate_ms=0.0` truthfully -- nothing
@@ -580,26 +619,29 @@ def _warp_series(
     """One dataset's summarised cells, flat across the estimator axis.
 
     `per_matcher` names a model whose cells exist for *some* matchers only, which is how a model
-    that solved nothing for one matcher is expressed. `similarity` is absent under `magsac`
-    throughout, because OpenCV cannot fit it there at all (F39).
+    that solved nothing for one matcher is expressed.
+
+    `similarity/magsac` is **present**, exactly as the server run produces it (F39/F47): the
+    runner summarises the unsupported rows like any others, so the cell exists carrying a NaN
+    mace and a truthful `success_rate_10px` of 0.0. A fixture that omitted the cell instead is
+    what let a block read that 0.0 as a score without a test noticing.
     """
     overrides = per_matcher or {}
     series: p3e_warp.Series = {}
     for model in p3e_warp.MODELS:
         for estimator in p3e_warp.ESTIMATORS:
-            if model == "similarity" and estimator == "magsac":
-                continue
+            unsupported = model == "similarity" and estimator == "magsac"
             values = overrides.get(model) or {
                 matcher: mace.get(model, 20.0) for matcher in matchers
             }
             for matcher, value in values.items():
                 series[model, estimator, matcher] = [
                     {
-                        p3e_warp.HEADLINE: value,
-                        p3e_warp.SECONDARY: 0.5,
-                        FAILURE_RATE: 0.0,
+                        p3e_warp.HEADLINE: float("nan") if unsupported else value,
+                        p3e_warp.SECONDARY: 0.0 if unsupported else 0.5,
+                        FAILURE_RATE: 1.0 if unsupported else 0.0,
                         "reg/n_pairs": 300.0,
-                        "time/estimate_ms": 1.0,
+                        "time/estimate_ms": 0.0 if unsupported else 1.0,
                     }
                 ]
     return series

@@ -365,16 +365,21 @@ def _scored(series: Series) -> int:
 
 
 def _is_unsupported(rows: Rows, key: tuple[str, str, str]) -> bool:
-    """True when every row of this cell is a capability gap rather than a measurement.
+    """True when this cell is a capability gap rather than a measurement.
 
     `estimator_unsupported_for_warp` rows carry `estimate_ms=0.0` (`eval/runner.py::
     _unsupported_row`), which is correct -- nothing was estimated -- and reads in a cost table as
     "free". A cell that could not run has no cost, so it prints `--`.
+
+    **`any`, not `all`** (F47). The gap is a property of the installed OpenCV
+    (`estimate/robust.py::SUPPORTED_ESTIMATORS`), so one row carrying the token settles the whole
+    cell -- and it has to, because a pair whose fit *raises* takes every variant of that
+    (pair, matcher) down with it (`eval/runner.py::run_benchmark` catches per pair, not per
+    variant). Three such pairs out of 300 were enough to make `all` report a column OpenCV
+    cannot fit at all as having run and cost 0.00 ms.
     """
     group = rows.get(key, [])
-    return bool(group) and all(
-        row.failure_reason == "estimator_unsupported_for_warp" for row in group
-    )
+    return any(row.failure_reason == "estimator_unsupported_for_warp" for row in group)
 
 
 def _unsupported_note(rows: Rows, estimator: str) -> str | None:
@@ -394,7 +399,9 @@ def _unsupported_note(rows: Rows, estimator: str) -> str | None:
             if warp == model and method == estimator
             for row in group
         ]
-        if cells and all(row.failure_reason == "estimator_unsupported_for_warp" for row in cells):
+        # `any` for the reason `_is_unsupported` documents (F47): a single raised pair would
+        # otherwise suppress this note, leaving a `--` column with no explanation beside it.
+        if any(row.failure_reason == "estimator_unsupported_for_warp" for row in cells):
             absent.append(model)
     if not absent:
         return None
@@ -591,13 +598,19 @@ def excess_block(
     return "\n".join(lines)
 
 
-def control_block(all_series: dict[str, Series], metric: str) -> str:
+def control_block(all_series: dict[str, Series], all_rows: dict[str, Rows], metric: str) -> str:
     """What the control column cost: MAGSAC against RANSAC, on the models that admit both.
 
     The stage has to run RANSAC because `similarity` admits nothing else, and a reader is
     entitled to ask what changing the estimator did to the two columns that did not have to.
     Rendered once per entry in `AGGREGATE_METRICS` and over `_common_matchers` -- the two
     corrections stage D's own output forced (F34, F37).
+
+    A cell OpenCV cannot fit is dropped by `_is_unsupported` and not by the metric's own value
+    (F47). On `reg/mace` the two agree, since a cell with no successes has no mean; on
+    `reg/success_rate_10px` they do not -- an unsupported cell reads a truthful 0.0000 there,
+    which in this table renders as "magsac scored zero where ransac scored 6%" about an
+    estimator that never ran. The predicate has to be the capability gap itself.
 
     Read as a scoping row, not a result: P3-10's F33 already measured the four estimators as
     sitting inside the seed spread on the failure-inclusive metric, and this stage carries one
@@ -619,6 +632,7 @@ def control_block(all_series: dict[str, Series], metric: str) -> str:
     lines += [header, "-" * len(header)]
     for dataset, series in all_series.items():
         matchers = _common_matchers(series)
+        rows = all_rows[dataset]
         for model in MODELS:
             cells: dict[str, float] = {}
             for estimator in ESTIMATORS:
@@ -626,6 +640,7 @@ def control_block(all_series: dict[str, Series], metric: str) -> str:
                     _metric(series, (model, estimator, matcher), metric)
                     for matcher in matchers
                     if not math.isnan(_metric(series, (model, estimator, matcher), metric))
+                    and not _is_unsupported(rows, (model, estimator, matcher))
                 ]
                 if values:
                     cells[estimator] = statistics.median(values)
@@ -746,7 +761,7 @@ def main_script(argv: list[str] | None = None) -> int:
     if all_series:
         blocks = [
             excess_block(all_rows, all_series, all_floors),
-            *(control_block(all_series, metric) for metric in AGGREGATE_METRICS),
+            *(control_block(all_series, all_rows, metric) for metric in AGGREGATE_METRICS),
             cost_block(all_series, all_rows),
         ]
         for block in blocks:

@@ -478,6 +478,35 @@ path)` pairs the run actually scored, and builds each truth with
 what "the truth" is. Shapes come from the rows themselves, so a dataset of mixed resolutions
 cannot silently be floored at one. Seconds, no matcher, no GPU.
 
+**What it settled, 2026-08-31** (TASKS.md P3-11 F47-F51). **The axis is Tier-1's, not the
+models'.** Only **15-18%** of the 14-15 px between-model gap survives each pair's own floor
+(ratio 0.18 on `flir`, 0.15 on `dronevehicle`), so the block prints GROUND TRUTH on both and the
+paper's warp-model row says so under X-4. The unpredicted part is the **sign**: floored, the
+homography carries the *largest* residual error and the affine the smallest (6.84 vs 4.38 px on
+`flir`) — a restricted model fits what it can represent more tightly, because the extra two
+degrees of freedom are estimated from the same noisy correspondences and paid for in variance.
+The homography wins outright and wins entirely on the part of the truth the others cannot reach.
+
+**And the F33/F34 asymmetry recurs on a third axis, in a form that is not survivorship.** A
+restricted model has the lower `reg/mace` in **15 of 32** printed rows and beats the homography
+on `reg/success_rate_10px` in **0 of 32**. `xfeat` fails zero pairs under all three models and
+still runs 51.40 -> 28.94 -> 25.85 px on `flir` as the DoF drop, while its success rate falls
+0.293 -> 0.143 -> 0.040: nothing is declined, the restricted model simply cannot produce the
+projective blow-ups a homography fitted to 14% inliers produces, so it caps the tail onto an
+11-16 px floor where a 10 px success is unreachable. `reg/mace` alone would report that as the
+restricted model winning. **Generalise F34's warning** from "a method that declines pairs" to
+"any change that shortens the tail without moving the mode", and quote this row
+failure-inclusive.
+
+Two reporting defects surfaced in the stage's own output and are fixed (F51), neither touching a
+measurement: `control_block` dropped a cell by testing the *aggregated metric* for NaN, which is
+right on `reg/mace` and wrong on `reg/success_rate_10px` — where an unsupported cell reads a
+truthful 0.0000 and printed as a score; and `_is_unsupported` asked whether *every* row carried
+`estimator_unsupported_for_warp`, which three raised pairs on `dronevehicle/sift` were enough to
+defeat, because `eval/runner.py::run_benchmark` catches per **pair** and discards all six
+variants' rows for that (pair, matcher). Both predicates now read the capability gap itself.
+**Any stage driver that gates a cell must gate it on the gap, not on the metric's value.**
+
 Stages F and G have unmet preconditions (P2-2's overlap generator, P2-3's degradations) and are
 listed to fix their shape, not to be launched.
 
@@ -504,7 +533,7 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | A | 1,200 | **~1.9 h** matcher time / **~2.8 h** wall clock, measured |
 | B | 4,800 | **11 h 4 min, measured** (7.5 h was projected from matcher time alone) |
 | C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
-| E | reduced-8, 28,800 rows off 4,800 matches | **~1.5-1.8 h projected** (2 swept passes x 6 variants), extrapolated from stage D's per-pass breakdown rather than from a cell rate: ~13 min matching, ~8 min per vanilla-RANSAC variant and ~2.1 min scoring per variant. **Vanilla RANSAC is ~half the bill** and is bought deliberately — it is the only estimator all three models admit, so it is the one column in which the model axis is unconfounded (P3-4a F39). Rewrite this row from `time/estimate_ms` once it has run |
+| E | reduced-8, 28,800 rows off 4,800 matches | **~1.1 h, measured** (2026-08-31; the `dronevehicle` swept pass ran **31 min 54 s**) against ~1.5-1.8 h projected. Rewritten from the run's own `time/estimate_ms` as this row said it should be. One pass is **12.2 min matching + the anchor estimate**, **6.5 min** estimating the other five variants and **~13 min** scoring them (~2.6 min per variant, against stage D's ~2.1). **Vanilla RANSAC was 19% of the bill, not the ~half projected** — 6.14 min, of which **5.50 min is `homography/ransac` alone**, i.e. 90% of the control column went to the one cell that had MAGSAC available anyway. The projection priced every RANSAC variant at stage D's ~8 min; that is right for a 4-point minimal set and wrong by 10-20x for a 3- or 2-point one, because RANSAC's iteration count goes as `w^-m` in the model's DoF (P3-11 F49). **Budget a restricted-model RANSAC variant at a small fraction of the homography's, and scale it by the matcher's inlier ratio** |
 | D | reduced-8, 288,000 rows off 24,000 matches | **~11 h 10 min, measured** (2026-08-31; 60 min 38 s per `flir` pass, 71–74 min per `dronevehicle` one) against **~4–5 h projected**. The collapse to **10 match passes** was still right — the frozen 120 invocations were ~38 h — but it won ~3.5×, not ~8×: **a swept pass costs ~3.8 single-variant cells**, because the twelve variants are twelve estimate-*and-score* cycles and not twelve `cv2.findHomography` calls. One `dronevehicle` pass is ~13 min matching, ~30 min estimation (~24 of it vanilla RANSAC alone), ~25 min scoring 28,800 rows, ~2 min Parquet and 96 W&B runs. Budget any future stage that sweeps a *scoring* axis at that ratio. Read the estimator's own bill off `time/estimate_ms`, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets

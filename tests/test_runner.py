@@ -72,6 +72,80 @@ def test_upsampling_does_not_inflate_the_reported_error(
     assert summary.metrics["reg/mace"] < SUBPIXEL_PX
 
 
+@pytest.mark.parametrize("factor", [0.5, 0.25])
+def test_a_symmetric_resize_does_not_inflate_the_reported_error(
+    aligned_dataset: Path, tmp_path: Path, factor: float
+) -> None:
+    """P3-12a's load-bearing test, and the reason stage F could not be launched before it.
+
+    The reference side carried ``scale=1.0`` unconditionally until this axis existed, so the
+    runner mapped only the *moving* keypoints back to native pixels. Resize both sides and leave
+    that half-mapping in place and the estimate is fitted from resized reference points to
+    native moving points -- a ``1/factor`` scale error in the recovered warp, which on this
+    240x320 fixture is tens of pixels and reads as the matcher having failed rather than as a
+    plumbing bug. Asserted against the axis's own soft floor (~``1/factor`` native pixels, since
+    a matcher localises to at best a scaled pixel), which is two orders of magnitude below what
+    a one-sided mapping produces.
+    """
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / f"run{factor}",
+        preprocess={"input_scale": factor},
+    )
+    (summary,) = run_benchmark(config)
+    assert summary.n_failed == 0
+    assert summary.metrics["reg/mace"] < SUBPIXEL_PX / factor
+
+
+def test_the_resolution_axis_leaves_the_metrics_in_native_pixels(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """What makes the levels of stage F comparable at all: the ground truth, the truth matrix
+    and the reporting ladder are the pair's *native* frame at every level, so `height`/`width`
+    and the 3/5/10/20 px columns mean one thing across the axis. Only the images the matcher
+    sees shrink."""
+    config = base_config(
+        aligned_dataset / "data.yaml", tmp_path / "native", preprocess={"input_scale": 0.5}
+    )
+    run_benchmark(config)
+    rows = read_rows(tmp_path / "native" / FILENAME)
+    assert {(row.height, row.width) for row in rows} == {(240, 320)}
+    assert {row.input_scale for row in rows} == {0.5}
+
+
+def test_the_default_resolution_level_reproduces_a_pre_axis_run_row_for_row(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """P3-12a is additive (X-5). `input_scale` 1.0 resizes nothing, so a run that sets it
+    explicitly must be indistinguishable from one written before the field existed -- which is
+    what lets every stage A-E directory on the server keep the numbers it was scored under."""
+    implicit = run_benchmark(base_config(aligned_dataset / "data.yaml", tmp_path / "implicit"))[0]
+    explicit = run_benchmark(
+        base_config(
+            aligned_dataset / "data.yaml", tmp_path / "explicit", preprocess={"input_scale": 1.0}
+        )
+    )[0]
+    assert implicit.metrics["reg/mace"] == explicit.metrics["reg/mace"]
+    assert implicit.metrics["reg/epe_mean"] == explicit.metrics["reg/epe_mean"]
+
+
+@pytest.mark.parametrize(
+    ("scale", "expected"),
+    [(1.0, "none-none-x1-magsac"), (0.5, "none-none-x1-r0.5-magsac")],
+)
+def test_the_resolution_level_names_a_cell_only_where_it_acts(
+    aligned_dataset: Path, tmp_path: Path, scale: float, expected: str
+) -> None:
+    """The rule the kernel, the P3-10 threshold and the P3-4a warp model already follow: an
+    axis appears in a W&B run name only where it is varied. Naming it unconditionally would
+    rename every stage A-E run, and a project whose run names drift between stages is one
+    nobody can read across them."""
+    config = base_config(
+        aligned_dataset / "data.yaml", tmp_path / f"name{scale}", preprocess={"input_scale": scale}
+    )
+    assert _variant_label(config, config.estimate) == expected
+
+
 @pytest.mark.parametrize(
     ("factor", "expected"),
     [(1, "none-none-x1-magsac"), (2, "none-none-x2-lanczos-magsac")],

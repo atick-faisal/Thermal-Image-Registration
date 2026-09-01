@@ -25,6 +25,12 @@ from cmreg.config.base import ConfigBase, ConfigError, as_config_error, deep_mer
 # Matches SplitManifest's sha256-hex-truncated convention (data/splits.py).
 _HASH_LENGTH = 16
 
+# The `PreprocessConfig.input_scale` every run before TASKS.md P3-12a implicitly used, and
+# therefore the value `config_hash` drops from its payload. Named rather than inlined because
+# the exemption and the field's default must be the same number or the exemption silently
+# re-points (the mistake `warp_model`'s test exists to catch).
+_UNRESIZED = 1.0
+
 
 class Domain(StrEnum):
     """The three domain families of PLAN.md §1. Reported separately, never pooled: a single
@@ -73,7 +79,16 @@ class Variant(StrEnum):
 
 
 class Interpolation(StrEnum):
-    """Resampling kernel for thermal upsampling (TASKS.md P3-9)."""
+    """Resampling kernel for thermal upsampling (TASKS.md P3-9).
+
+    Deliberately *not* extended with ``area`` for P3-12a's resolution axis. ``cv2.INTER_AREA``
+    is the only kernel that anti-aliases a downscale and is the one that axis uses, but this
+    enum is the choice type of ``PreprocessConfig.moving_interpolation``, whose factor is >= 1
+    by validation -- and ``INTER_AREA`` above 1x degenerates to nearest-neighbour. A member no
+    field of this enum's type may legally take is a knob whose failure mode is "it silently
+    means something else", so the resolution axis resolves its kernel from the direction
+    instead (``preprocess/variants.py::kernel_for``) and never stores one.
+    """
 
     NEAREST = "nearest"
     BILINEAR = "bilinear"
@@ -307,6 +322,26 @@ class PreprocessConfig(ConfigBase):
     # Kernel used for that upsampling. `nearest` is included only as the ablation's floor;
     # it introduces staircase edges that gradient-based detectors happily fire on.
     moving_interpolation: Interpolation = Interpolation.BICUBIC
+    # Stage F's resolution axis (TASKS.md P3-12a), applied to **both** sides at once. `1.0` --
+    # the default -- is every run before P3-12a and resizes nothing.
+    #
+    # Symmetric by construction, and that is the whole point of the field: `moving_upsample`
+    # above resizes the moving side alone, which stage C measured to be an N-fold *scale
+    # mismatch* between the two views rather than a resolution change (P3-9 F25). An asymmetric
+    # resolution sweep would therefore re-measure that finding instead of resolution, so this
+    # axis exists separately rather than by reusing the P3-9 field.
+    #
+    # It does **not** move the frame the metrics are reported in: keypoints from both sides are
+    # mapped back to native pixels before estimation (`Preprocessed.to_native`), so `H_gt`, the
+    # truth, the dense field, `corner_error` and the GRID.md §2 reporting ladder are identical
+    # at every level and the levels are directly comparable. Failure mode if that plumbing is
+    # ever dropped on one side: the estimate is fitted across two coordinate frames and reads as
+    # a catastrophic matcher failure for a reason that has nothing to do with resolution.
+    #
+    # The soft floor to quote beside any row of this axis: at scale `s` a matcher can localise to
+    # at best ~1 scaled pixel, i.e. `1/s` native pixels, so a low-resolution row is bounded below
+    # in exactly the sense `experiments/GRID.md` §3's `R` is.
+    input_scale: float = _UNRESIZED
 
     @model_validator(mode="after")
     def _percentiles_ordered(self) -> Self:
@@ -316,6 +351,16 @@ class PreprocessConfig(ConfigBase):
                 f"{self.percentile_low} / {self.percentile_high}"
             )
         return self
+
+    @field_validator("input_scale")
+    @classmethod
+    def _input_scale_range(cls, value: float) -> float:
+        # Bounded rather than merely positive: below ~0.05 a 640x512 pair is 32x26 and no
+        # matcher's stride reaches it, and above 4x the pair no longer fits a 40 GB card at
+        # reduced-8's batch of one dense backend.
+        if not 0.05 <= value <= 4.0:
+            raise ValueError(f"input_scale must be in [0.05, 4.0], got {value}")
+        return value
 
     @field_validator("moving_upsample")
     @classmethod
@@ -626,6 +671,12 @@ class Config(ConfigBase):
         the hash, and a *future* change of the default would silently re-point this exemption --
         which is why the default is named in the test that pins it, not just here.
 
+        **P3-12a's `input_scale` is dropped at `1.0`** under that same scalar rule. It is the
+        third exemption and the last one this pattern should need: a new *axis* that every prior
+        run implicitly sat at one value of has to be absent from the payload at that value, or
+        the resume guard refuses directories whose science did not change. Stages A-E are all
+        `1.0`, so they keep the hashes they were scored under.
+
         Deliberately narrow rather than `exclude_defaults=True`: that would drop every
         defaulted field at once and move all the existing hashes it is here to preserve.
         """
@@ -636,6 +687,8 @@ class Config(ConfigBase):
                 del estimate[axis]
         if estimate["warp_model"] == WarpModel.HOMOGRAPHY.value:
             del estimate["warp_model"]
+        if payload["preprocess"]["input_scale"] == _UNRESIZED:
+            del payload["preprocess"]["input_scale"]
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[
             :_HASH_LENGTH
         ]

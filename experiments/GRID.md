@@ -218,7 +218,7 @@ the only aerial one.
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
-| F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 |
+| F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 (resolution axis landed as **P3-12a**) |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -343,9 +343,8 @@ variants is the open question, and P3-10 records it.
 
 **Stage F must resize *both* sides.** Stage C measured the asymmetric direction and it is
 dominated by scale mismatch (P3-9 F25), so an asymmetric resolution sweep would re-measure that
-rather than resolution. The precondition: `PreprocessConfig` has no reference-side resize field,
-because `preprocess_reference` deliberately never resizes — P3-12 has to add one, or express the
-sweep as a decode-time resize of the pair before the frame is fixed.
+rather than resolution. **The precondition is met: `preprocess.input_scale` landed as P3-12a**
+(2026-09-01), and the subsection below is its design.
 
 ### Stage D's twelve variants, and why they cost ten match passes
 
@@ -507,8 +506,53 @@ defeat, because `eval/runner.py::run_benchmark` catches per **pair** and discard
 variants' rows for that (pair, matcher). Both predicates now read the capability gap itself.
 **Any stage driver that gates a cell must gate it on the gap, not on the metric's value.**
 
-Stages F and G have unmet preconditions (P2-2's overlap generator, P2-3's degradations) and are
-listed to fix their shape, not to be launched.
+### Stage F's resolution half, and the frame it is scored in
+
+`preprocess.input_scale` (TASKS.md P3-12a) resizes **both** sides by one factor before matching.
+Two ways to express a resolution sweep were available and they differ in what the numbers mean;
+this is the second, and the choice is the whole of the design.
+
+**A decode-time resize was rejected.** Shrinking the pair before `H_gt` is sampled puts the
+ground truth, the truth matrix, the dense field and every metric in *scaled* pixels, so 5 px at
+×0.25 is 20 native px and §2's reporting ladder means a different thing at each level. It also
+breaks §3's composition outright: `ResidualCalibration.validate_for` is fatal at the wrong
+resolution *by design*, because `calibration/flir.json`'s corner field measured at 640×512 is
+silently half the misalignment it claims at 320×256.
+
+**What runs instead: resize the images, keep the frame.** `H_gt`, `truth`, `gt_field`,
+`corner_error` and `PairRow.height`/`width` all stay at the pair's native shape; only the two
+images handed to the matcher shrink, and both sides' keypoints come back through
+`Preprocessed.to_native` before estimation. So every level is scored against *identically the
+same ground truth* on *the same ladder*, `R` composition is untouched, and a stage-F row is
+directly comparable with stage A's. It is also the smaller change: the moving side has mapped
+back since P3-9, half-pixel sampling-grid convention included, and P3-12a supplied the other
+half.
+
+**Mapping only one side back is the failure this axis can produce**, and it does not announce
+itself: at ×0.5 the estimate is fitted from half-resolution reference points to native moving
+points, a 2× scale error in the recovered warp that reads as the matcher having failed.
+`tests/test_runner.py::test_a_symmetric_resize_does_not_inflate_the_reported_error` was run
+against a deliberately one-sided implementation to confirm it fails there.
+
+**Quote every row beside the axis's own floor**, as §3's `R` rows and stage E's model rows are.
+At scale `s` a matcher localises to at best ~1 scaled pixel, i.e. `1/s` native pixels. Measured
+on the mono-modal fixture, where nothing else is in the way: `reg/mace` 0.45 px at ×0.5 and
+1.02 px at ×0.25 against ~0.2 px at ×1 — so the floor is real and close to `1/s`. The cheap
+*measured* version on real data is P1-1b's mono-modal control re-run per level (one flag,
+`gt.reference == gt.moving`), and stage F should carry it rather than quoting the bound.
+
+**Levels: 1.0 / 0.75 / 0.5 / 0.25.** Chosen so they divide 640×512 exactly — an anisotropic
+resize is refused rather than rounded, because `to_native` inverts a single scale and an x/y
+mismatch would be a systematic sub-pixel bias that reads as a worse matcher.
+
+**Cost is one match pass per level**, unlike stages D and E: this axis is *upstream* of the
+matcher, so it cannot be swept off one `MatchResult`. §7's line that stage C's upsampling cost
+does not budget stage F still stands, and now for a second reason — stage F mostly *shrinks*,
+where stage C only enlarged. The match-count half of the stage is the opposite case and is
+downstream; it is **P3-12b**, together with `scripts/p3f_resolution.py`.
+
+Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
+listed to fix its shape, not to be launched.
 
 ## 7. Cost
 

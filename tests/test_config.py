@@ -15,6 +15,7 @@ from cmreg.config import (
     EstimateConfig,
     Estimator,
     Platform,
+    PreprocessConfig,
     WarpModel,
     deep_merge,
 )
@@ -196,6 +197,39 @@ def test_the_default_config_hash_is_unchanged_by_the_warp_model_field() -> None:
     """
     assert EstimateConfig().warp_model is WarpModel.HOMOGRAPHY
     assert Config().config_hash() == "04f02efbd8b566ed"
+
+
+def test_the_default_config_hash_is_unchanged_by_the_resolution_field() -> None:
+    """The P3-12a exemption, the third instance of the scalar rule and pinned the same way.
+
+    `input_scale` always has a value, so without the exemption adding stage F's axis would move
+    every hash in the project and `scripts/stages.py::refuse_a_stale_run` would refuse every
+    completed stage A-E directory on the server for a change that altered no science. The
+    literal is the hash those directories were scored under, and it must not move again.
+
+    Asserting the default alongside it is the point at which the exemption would otherwise
+    silently re-point, exactly as the `warp_model` test above does.
+    """
+    assert PreprocessConfig().input_scale == 1.0
+    assert Config().config_hash() == "04f02efbd8b566ed"
+
+
+def test_a_non_default_resolution_level_hashes_apart() -> None:
+    """The property the resume guard needs: a run that matched at half resolution is a
+    different experiment, and resuming one onto the other's directory is refused."""
+    default = Config()
+    halved = default.model_copy(
+        update={"preprocess": default.preprocess.model_copy(update={"input_scale": 0.5})}
+    )
+    assert halved.config_hash() != default.config_hash()
+
+
+def test_the_resolution_level_is_bounded_at_both_ends() -> None:
+    """Below ~0.05 a 640x512 pair is 32x26 and no matcher's stride reaches it; above 4x a dense
+    backend no longer fits the card."""
+    for value in (0.0, 0.01, 4.5):
+        with pytest.raises(ValidationError):
+            PreprocessConfig(input_scale=value)
 
 
 def test_a_non_default_warp_model_hashes_apart() -> None:

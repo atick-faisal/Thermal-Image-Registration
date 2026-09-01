@@ -72,6 +72,7 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
     "interpolation": ("preprocess", "moving_interpolation"),
+    "input_scale": ("preprocess", "input_scale"),
     "domain": ("eval", "domain"),
     "platform": ("eval", "platform"),
 }
@@ -181,6 +182,16 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         "--interpolation",
         choices=_INTERPOLATIONS,
         help="resampling kernel for that upsampling",
+    )
+    # Stage F's axis (P3-12a), and the one resize flag that touches **both** sides. `--upsample`
+    # above is the moving side alone, which stage C measured as a scale mismatch rather than a
+    # resolution change (P3-9 F25); confusing the two is the reason they are separate flags with
+    # separate names rather than one flag with a side argument.
+    parser.add_argument(
+        "--input-scale",
+        dest="input_scale",
+        type=float,
+        help="resize BOTH sides by this factor before matching (0.05-4.0; P3-12a stage F)",
     )
     # Labels, not knobs -- but a campaign that points one config at four datasets has to
     # relabel them per cell, and a `dronevehicle` row filed as `driving/public` is pooled

@@ -100,7 +100,7 @@ from cmreg.gt import (
 from cmreg.imaging import ImagingError, read_gray
 from cmreg.matchers import MatchResult, get_matcher
 from cmreg.metrics import corner_error, diagonal, endpoint_error
-from cmreg.preprocess import GrayImage, preprocess_moving, preprocess_reference
+from cmreg.preprocess import GrayImage, Preprocessed, preprocess_moving, preprocess_reference
 from cmreg.results import PairRow, Summary, render, render_comparison, summarize, write_rows
 from cmreg.seeding import seed_cell
 from cmreg.tracking import RunTracker, git_sha, run_name, run_tags
@@ -136,8 +136,16 @@ class _Pair:
     """One decoded pair, warped and preprocessed once for all matchers."""
 
     stem: str
+    # **Native** pixels, and every metric below is in them. P3-12a's `input_scale` resizes the
+    # images handed to the matcher, not this: keypoints come back through
+    # `Preprocessed.to_native` before estimation, so the ground truth, the truth matrix, the
+    # dense field and the reporting ladder are identical at every level of that axis.
     shape: tuple[int, int]
-    reference: GrayImage
+    # The preprocessed reference, *with its scale* -- not a bare image. Until P3-12a this side
+    # was never resized and the scale was always 1.0; it is carried now because dropping it on
+    # exactly one side is the failure this axis can produce (an estimate fitted across two
+    # coordinate frames, which reads as a catastrophic matcher failure).
+    reference: Preprocessed
     moving_warped: GrayImage
     # `H_gt` maps the moving image into the reference canvas; the matcher has to recover its
     # inverse, composed with the dataset's residual `R` when one is configured. Both are
@@ -319,6 +327,11 @@ def _identity_columns(
         "preprocess_mov": config.preprocess.moving.value,
         "upsample": config.preprocess.moving_upsample,
         "interpolation": config.preprocess.moving_interpolation.value,
+        # Stage F's axis (P3-12a). A run constant rather than a per-row column, because it sits
+        # *upstream* of the matcher -- unlike `estimator`/`threshold_px`/`warp`, which P3-10 and
+        # P3-4a sweep off one match pass, a resolution level costs its own match pass and is
+        # therefore its own run.
+        "input_scale": config.preprocess.input_scale,
         # `estimator`, `threshold_px` and `warp` are deliberately absent: P3-10 and P3-4a sweep
         # all three *within* a run, so they are per-row rather than constant. `_row` and
         # `_failed_row` set them from the variant that produced the row.
@@ -392,7 +405,7 @@ def _load_pair(
     return _Pair(
         stem=optical_path.stem,
         shape=shape,
-        reference=preprocess_reference(reference, config.preprocess).image,
+        reference=preprocess_reference(reference, config.preprocess),
         moving_warped=moving_warped,
         truth=truth,
         gt_field=dense_displacement(truth, shape),
@@ -420,13 +433,20 @@ def _evaluate(
     # depend on which other matchers happened to share its config.
     seed_cell(config.gt.seed, index, name)
     moving = preprocess_moving(pair.moving_warped, config.preprocess)
-    result: MatchResult = matcher(pair.reference, moving.image)
+    result: MatchResult = matcher(pair.reference.image, moving.image)
 
     # Back to native pixels before estimation, so every metric is in reference-image units
-    # whatever the upsampling factor was (preprocess/variants.py explains the half-pixel term).
-    # Hoisted out of the variant loop with the match itself: nothing here depends on the
-    # estimator, and repeating it would charge the sweep for work it does not do.
-    kpts_reference = result.kpts0
+    # whatever the upsampling factor and the resolution level were (preprocess/variants.py
+    # explains the half-pixel term). Hoisted out of the variant loop with the match itself:
+    # nothing here depends on the estimator, and repeating it would charge the sweep for work
+    # it does not do.
+    #
+    # **Both sides, since P3-12a.** The reference line was `result.kpts0` unchanged while that
+    # side could not be resized. Mapping only one side back is not a small error: at
+    # `input_scale` 0.5 the estimate would be fitted from half-resolution reference points to
+    # native moving points, which is a 2x scale error in the recovered warp and reads as the
+    # matcher having failed.
+    kpts_reference = pair.reference.to_native(result.kpts0)
     kpts_moving = moving.to_native(result.kpts1)
 
     rows: list[PairRow] = []
@@ -634,6 +654,10 @@ def _variant_label(config: Config, variant: EstimateConfig) -> str:
     The warp model follows it exactly (TASKS.md P3-4a): homography in stages A-D, so naming it
     there would rename every run already in W&B, and swept in stage E, where without it three
     models would collide into one run name.
+
+    P3-12a's resolution level is the fourth instance of the same rule, and the first that is a
+    *run* constant rather than a swept one: it is 1.0 in stages A-E, and stage F varies it
+    across runs that would otherwise share a name entirely.
     """
     label = (
         f"{config.preprocess.reference.value}-{config.preprocess.moving.value}"
@@ -641,6 +665,8 @@ def _variant_label(config: Config, variant: EstimateConfig) -> str:
     )
     if config.preprocess.moving_upsample > 1:
         label += f"-{config.preprocess.moving_interpolation.value}"
+    if config.preprocess.input_scale != 1.0:
+        label += f"-r{config.preprocess.input_scale:g}"
     if config.estimate.sweep_warp_models:
         label += f"-{variant.warp_model.value}"
     label += f"-{variant.method.value}"

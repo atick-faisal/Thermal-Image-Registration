@@ -38,6 +38,7 @@ def make_row(
         preprocess_mov="percentile",
         upsample=1,
         interpolation="bicubic",
+        input_scale=1.0,
         estimator="magsac",
         threshold_px=3.0,
         warp="homography",

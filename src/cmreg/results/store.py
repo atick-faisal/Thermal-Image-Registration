@@ -67,6 +67,16 @@ class PairRow:
     preprocess_mov: str
     upsample: int
     interpolation: str
+    # Stage F's resolution level (TASKS.md P3-12a): the factor **both** sides were resized by
+    # before matching. Nullable, and the null means "written before this axis existed" -- every
+    # stage A-E file on the server predates it, `read_rows` backfills a missing nullable column
+    # and a missing non-nullable one is fatal (see below). Writing 1.0 into those rows instead
+    # would be inventing a value the file never recorded, even though it is the one they ran at.
+    #
+    # Note this is *not* the resolution the row's metrics are in: `height`/`width` above are
+    # native and so is every error column, because keypoints are mapped back before estimation
+    # (`eval/runner.py::_evaluate`). It is the resolution the *matcher* saw.
+    input_scale: float | None
     estimator: str
     threshold_px: float
     warp: str

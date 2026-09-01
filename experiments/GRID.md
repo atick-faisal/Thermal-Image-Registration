@@ -218,7 +218,7 @@ the only aerial one.
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
-| F | input resolution (**both sides**) x match count | reduced-8 | driving+aerial | ~16 | 1 | P3-12 (resolution axis landed as **P3-12a**) |
+| **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column (**match count → P3-12c**) | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**) |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -291,6 +291,12 @@ by measurement (its wrapper only pads to a multiple of 32, so the resize is insi
 config). For those four the axis is a *resample prefilter*, so they stay in the
 anchor-kernel factor column — which is what measures that prefilter at 300 pairs — and sit out
 the three other kernels, where they would have bought four indistinguishable rows.
+
+**That split is stage C's alone and does not carry to stage F.** Being resized to a fixed
+internal resolution makes a matcher blind to pixels *added* — stage C's direction — and says
+nothing about pixels *removed*: `roma` upsampling a 160-wide crop back to 560×560 cannot recover
+what `cv2.INTER_AREA` discarded. Stage F therefore runs **all eight** at all four levels, and a
+flat row there would be a finding rather than a design assumption (X-4).
 
 **Read that split off accuracy, not off runtime** (P3-9 F28). The design was chosen on a
 Mac-CPU probe where those four were *cost*-flat — `matchanything-roma` read 19,219 / 19,135 /
@@ -549,7 +555,19 @@ mismatch would be a systematic sub-pixel bias that reads as a worse matcher.
 matcher, so it cannot be swept off one `MatchResult`. §7's line that stage C's upsampling cost
 does not budget stage F still stands, and now for a second reason — stage F mostly *shrinks*,
 where stage C only enlarged. The match-count half of the stage is the opposite case and is
-downstream; it is **P3-12b**, together with `scripts/p3f_resolution.py`.
+downstream; it is **P3-12c**.
+
+**`scripts/p3f_resolution.py` is the driver and landed as P3-12b** (2026-09-01), carrying the
+floor column on `flir` as this subsection asks: reduced-8, four levels, `gt.reference ==
+gt.moving` on the thermal side, `preprocess` none/none, and — the part that is not obvious —
+**uncomposed**. `stages.CELLS` marks `flir` `composes=True`, so reusing the benchmark cell for
+the control would fold the ~9.5 px rig constant into a pair matched against a warped copy of
+*itself*, which has no cross-modal pairing and therefore no residual to remove: the floor would
+read ~9–10 px, swamp the axis it exists to bound, and report every level as floor-limited. The
+driver carries a separate `FLOOR_CELL` with `composes=False` and
+`tests/test_grid_driver.py::TestStageF` pins the *resolved* config rather than the flags.
+`dronevehicle` has no control cell and its rows are quoted against the `floor(×1)/s` prediction
+instead, with the block naming which of the two each row used.
 
 Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
 listed to fix its shape, not to be launched.

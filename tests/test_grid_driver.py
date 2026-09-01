@@ -10,6 +10,7 @@ the new banner. Nothing in the pasted console said so.
 from __future__ import annotations
 
 import statistics
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import p3_stageb_polarity  # on the path via `[tool.pytest.ini_options] pythonpa
 import p3c_upsample
 import p3d_estimator
 import p3e_warp
+import p3f_resolution
 import stages
 from cmreg.metrics.schema import FAILURE_RATE
 from cmreg.results import write_rows
@@ -675,3 +677,253 @@ def _warp_rows(
                     for stem in ("a", "b")
                 ]
     return rows
+
+
+class TestStageF:
+    """`scripts/p3f_resolution.py` (P3-12b). The stage whose cheapest mistake is invisible.
+
+    Four things are pinned here. The cost model, because this axis is the one that *cannot* be
+    swept off a single `MatchResult` and a driver that tried would silently score three of its
+    four levels at the wrong resolution. The `config_hash` exemption, because it is what makes
+    `refuse_a_stale_run` refuse a stale *level* directory rather than tabulating x0.5's rows
+    under the x1 banner. The floor cell's composition, which is this stage's silent failure --
+    see the driver's module docstring. And the two blocks whose arithmetic *is* the finding.
+    """
+
+    def test_the_stage_is_one_match_pass_per_level(self) -> None:
+        """GRID.md §6: the resolution axis sits **upstream** of the matcher
+        (`eval/runner.py::_identity_columns`), so unlike stages D and E it costs one match pass
+        per level rather than one fit off a shared match. Twelve distinct directories, and the
+        floor arm's must not collide with the cross-modal arm's -- a collision would resume-skip
+        the control onto the benchmark's own rows and print them as the floor."""
+        dirs = [
+            p3f_resolution.run_dir_for(cell, level)
+            for cell in stages.CELLS
+            if cell.dataset in p3f_resolution.DATASETS
+            for level in p3f_resolution.LEVELS
+        ]
+        dirs += [p3f_resolution.floor_run_dir_for(level) for level in p3f_resolution.LEVELS]
+        assert len(dirs) == 12
+        assert len(set(dirs)) == len(dirs)
+
+    def test_every_level_divides_the_benchmark_shape_exactly(self) -> None:
+        """P3-12a F56: `rescale` refuses an anisotropic resize rather than rounding it, because
+        `to_native` inverts a *single* scale and an x/y mismatch is a systematic sub-pixel bias
+        that reads as a worse matcher. Both stage-F datasets are 640x512, so the level list has
+        to be exact on both axes -- which is why these four levels and not, say, x0.6."""
+        for level in p3f_resolution.LEVELS:
+            for extent in (640, 512):
+                scaled = level * extent
+                assert scaled == int(scaled), f"x{level:g} is anisotropic on {extent}"
+
+    def test_the_floor_cell_does_not_compose_the_rig_constant(self) -> None:
+        """**The oracle for this stage's silent failure.**
+
+        `stages.CELLS` marks `flir` `composes=True`. A control cell built from it would fold
+        `calibration/flir.json`'s ~9.5 px rig constant into a pair matched against a warped copy
+        of *itself* -- which has no cross-modal pairing and therefore no residual to remove. The
+        floor would read ~9-10 px instead of ~0.2-1.0 px and would swamp the axis it exists to
+        bound. Asserted on the *resolved* config, through `cmreg`'s own parser, so the pin is on
+        what the run does rather than on which flags this file happens to pass.
+        """
+        from cmreg.cli import build_parser, overrides_from_args
+        from cmreg.config import Config
+
+        for level in p3f_resolution.LEVELS:
+            args = build_parser().parse_args(p3f_resolution.floor_argv_for(level))
+            config = Config.load(args.config, overrides_from_args(args))
+            assert config.gt.residual_calibration is None, f"x{level:g} composed a rig it lacks"
+            assert config.gt.is_monomodal
+            assert config.gt.reference_modality.value == p3f_resolution.FLOOR_MODALITY
+            # An asymmetric recipe would manufacture the polarity gap the control removes.
+            assert config.preprocess.reference.value == "none"
+            assert config.preprocess.moving.value == "none"
+            assert config.preprocess.input_scale == level
+        # The contrast, on the same dataset at the same level: the cross-modal arm *does*
+        # compose, so this is a property of the control and not of the driver forgetting a flag.
+        cell = next(c for c in stages.CELLS if c.dataset == p3f_resolution.FLOOR_DATASET)
+        args = build_parser().parse_args(p3f_resolution.argv_for(cell, 0.5))
+        composed = Config.load(args.config, overrides_from_args(args))
+        assert composed.gt.residual_calibration is not None
+        assert not composed.gt.is_monomodal
+
+    def test_the_anchor_level_keeps_the_pre_axis_hash_and_the_others_move(self) -> None:
+        """P3-12a F58, in the form `refuse_a_stale_run` consumes it. `input_scale` is dropped
+        from the payload at 1.0, so the anchor level resolves to the hash every stage A-E
+        directory on the server already carries -- and every other level hashes apart, which is
+        what stops x0.5's rows being resumed into the x1 cell and printed under its banner."""
+        cell = next(c for c in stages.CELLS if c.dataset == "dronevehicle")
+        anchor = stages.intended_hash(p3f_resolution.argv_for(cell, 1.0))
+        others = {
+            level: stages.intended_hash(p3f_resolution.argv_for(cell, level))
+            for level in p3f_resolution.LEVELS
+            if level != 1.0
+        }
+        assert anchor not in others.values()
+        assert len(set(others.values())) == len(others)
+        # The scalar exemption itself: passing the default explicitly changes nothing.
+        without = [flag for flag in p3f_resolution.argv_for(cell, 1.0) if flag != "--input-scale"]
+        assert stages.intended_hash([f for f in without if f != "1"]) == anchor
+
+    def test_the_run_argv_is_the_scientific_argv_plus_the_invocation(self) -> None:
+        """Both arms. The tests above resolve `argv_for`/`floor_argv_for` and the server runs
+        `run`/`run_floor`; if the two could drift, every floor printed beside a row would belong
+        to a different config than the row does -- invisible in the table, wrong in the answer."""
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        scientific = p3f_resolution.argv_for(cell, 0.5)
+        assert _stage_f_argv(cell, 0.5)[: len(scientific)] == scientific
+        floor = p3f_resolution.floor_argv_for(0.5)
+        assert _stage_f_floor_argv(0.5)[: len(floor)] == floor
+
+    def test_the_floor_prediction_is_the_anchor_row_over_the_level(self) -> None:
+        """F54 says the floor is "close to 1/s" and the fixture's numbers say what that means:
+        0.45 px at x0.5 and 1.02 px at x0.25 against ~0.2 px at x1 is the x1 floor *scaled*, not
+        1/s in absolute terms. Predicted off this run's own anchor row so it is calibrated on the
+        data it is checked against."""
+        table = _res_table({1.0: 0.2, 0.5: 0.45, 0.25: 1.02})
+        levels = [1.0, 0.5, 0.25]
+        assert p3f_resolution._predicted_floor(table, levels, 0.5) == pytest.approx(0.4)
+        assert p3f_resolution._predicted_floor(table, levels, 0.25) == pytest.approx(0.8)
+
+    def test_a_level_swamped_by_its_own_floor_is_flagged(self) -> None:
+        """The block's whole job. Built so x0.25's error is barely above the control's at the
+        same level: without the floor column the row reads as a working registration, and with
+        it the row is the axis measuring its own localisation limit."""
+        errors = _res_errors({1.0: 6.0, 0.25: 2.0})
+        floor = _res_errors({1.0: 0.2, 0.25: 1.8})
+        block = p3f_resolution.floor_limited_block(
+            {"flir": _res_table({1.0: 6.0, 0.25: 2.0})},
+            {"flir": errors},
+            _res_table({1.0: 0.2, 0.25: 1.8}),
+            floor,
+            (1.0, 0.25),
+        )
+        rows = {line.split()[1]: line for line in block.splitlines() if line.startswith("flir")}
+        assert "FLOOR-LIMITED" in rows["x0.25"]
+        assert "FLOOR-LIMITED" not in rows["x1"]
+        assert "measured" in rows["x0.25"]
+
+    def test_a_dataset_without_a_control_says_so_rather_than_borrowing_one(self) -> None:
+        """The floor is bought on `flir` only, so `dronevehicle` is read against the x1/s
+        prediction. A floor whose provenance a reader cannot see is worse than no floor."""
+        block = p3f_resolution.floor_limited_block(
+            {"dronevehicle": _res_table({1.0: 6.0, 0.5: 9.0})},
+            {"dronevehicle": _res_errors({1.0: 6.0, 0.5: 9.0})},
+            _res_table({1.0: 0.2, 0.5: 0.45}),
+            _res_errors({1.0: 0.2, 0.5: 0.45}),
+            (1.0, 0.5),
+        )
+        rows = [line for line in block.splitlines() if line.startswith("dronevehicle")]
+        assert rows and all(line.split()[-1] == "pred" for line in rows)
+        assert not any("measured" in line for line in rows)
+
+    def test_a_median_over_matchers_is_not_shifted_by_a_level_that_lost_one(self) -> None:
+        """F37 in this stage's shape, and it bites harder here than it did in stage D: x0.25 is
+        precisely the level at which a matcher is expected to stop solving, so a median over
+        "whatever this level has" would compare a median over eight matchers with one over six
+        and report the survivors' scores as the level's."""
+        table = _res_table({1.0: 5.0, 0.25: 9.0})
+        table["x0.25"]["m3"] = dict(table["x0.25"]["m3"], **{p3f_resolution.HEADLINE: float("nan")})
+        assert p3f_resolution._common_matchers(table, [1.0, 0.25]) == ["m1", "m2"]
+        note = p3f_resolution._excluded_note({"flir": table}, (1.0, 0.25))
+        assert note is not None and "m3 excluded" in note
+
+    def test_the_floor_and_the_error_are_medians_over_one_matcher_set(self) -> None:
+        """F37 applied *across arms* rather than across levels, and it is the defect the first
+        smoke run of this driver actually had: the benchmark's row excluded a matcher the control
+        kept, so the printed ratio divided a median over two matchers by a median over four. The
+        control is the easier problem -- a pair matched against a warped copy of itself -- so it
+        goes on solving after the benchmark stops, and the two sets diverge at exactly the low
+        levels this stage exists to characterise."""
+        matchers = ("m1", "m2", "m3", "m4")
+        table = _res_table({1.0: 6.0, 0.25: 6.0}, matchers=matchers)
+        for name in ("m3", "m4"):
+            table["x0.25"][name] = dict(
+                table["x0.25"][name], **{p3f_resolution.HEADLINE: float("nan")}
+            )
+        floor = _res_table({1.0: 0.2, 0.25: 0.5}, matchers=matchers)
+        errors: p3f_resolution.Errors = {
+            label: dict.fromkeys(matchers, 6.0) for label in ("x1", "x0.25")
+        }
+        floor_errors: p3f_resolution.Errors = {
+            "x1": dict.fromkeys(matchers, 0.2),
+            # The two the benchmark lost score far worse in the control. Including them takes the
+            # floor from 0.50 to 25.25 and the row from "registration" to "FLOOR-LIMITED".
+            "x0.25": {"m1": 0.5, "m2": 0.5, "m3": 50.0, "m4": 50.0},
+        }
+        block = p3f_resolution.floor_limited_block(
+            {"flir": table}, {"flir": errors}, floor, floor_errors, (1.0, 0.25)
+        )
+        (row,) = [line for line in block.splitlines() if line.split()[1:2] == ["x0.25"]]
+        assert row.split()[3] == "0.50"
+        assert "FLOOR-LIMITED" not in row
+
+    def test_the_ranking_block_reports_a_saturated_level_rather_than_crashing(self) -> None:
+        """`statistics.correlation` raises on a constant series, and a level where every matcher
+        scores 0.000 legitimately produces one -- which is the *expected* shape of x0.25 on the
+        failure-inclusive metric. Reported as `flat`; a crash here would cost the whole console
+        block after four hours of GPU time."""
+        table = _res_table(
+            {1.0: 5.0, 0.25: 9.0}, per_matcher={1.0: {"m1": 4.0, "m2": 5.0, "m3": 6.0}}
+        )
+        block = p3f_resolution.ranking_block({"flir": table}, (1.0, 0.25), p3f_resolution.HEADLINE)
+        assert "flat" in block
+
+
+def _stage_f_argv(cell: stages.Cell, level: float) -> list[str]:
+    """The argv `p3f_resolution.run` would build, captured without running anything."""
+    return _capture(lambda: p3f_resolution.run(cell, level, "cpu", stages.DryRun(wandb=False)))
+
+
+def _stage_f_floor_argv(level: float) -> list[str]:
+    return _capture(lambda: p3f_resolution.run_floor(level, "cpu", stages.DryRun(wandb=False)))
+
+
+def _capture(call: Callable[[], object]) -> list[str]:
+    captured: list[list[str]] = []
+    original = p3f_resolution.run_cell
+    p3f_resolution.run_cell = lambda _cell, _dir, argv, _banner: captured.append(argv) or True
+    try:
+        call()
+    finally:
+        p3f_resolution.run_cell = original
+    return captured[0]
+
+
+def _res_table(
+    mace: dict[float, float],
+    per_matcher: dict[float, dict[str, float]] | None = None,
+    matchers: tuple[str, ...] = ("m1", "m2", "m3"),
+) -> p3f_resolution.Table:
+    """One arm's summarised cells, keyed by level label.
+
+    `per_matcher` names a level whose matchers carry different values, which is how an ordering
+    change is expressed -- the ranking block is the one renderer that reads across matchers
+    within a level rather than across levels within a matcher.
+    """
+    overrides = per_matcher or {}
+    table: p3f_resolution.Table = {}
+    for level, value in mace.items():
+        values = overrides.get(level) or dict.fromkeys(matchers, value)
+        table[p3f_resolution.label_for(level)] = {
+            matcher: {
+                p3f_resolution.HEADLINE: cell,
+                p3f_resolution.SECONDARY: 0.5,
+                FAILURE_RATE: 0.0,
+                "reg/n_pairs": 300.0,
+                "time/total_ms": 100.0 * level,
+            }
+            for matcher, cell in values.items()
+        }
+    return table
+
+
+def _res_errors(
+    median: dict[float, float], matchers: tuple[str, ...] = ("m1", "m2", "m3")
+) -> p3f_resolution.Errors:
+    """The per-pair median corner errors the floor block divides. Takes the same shape
+    `_res_table` does, so the two cannot disagree about what a level scored."""
+    return {
+        p3f_resolution.label_for(level): dict.fromkeys(matchers, value)
+        for level, value in median.items()
+    }

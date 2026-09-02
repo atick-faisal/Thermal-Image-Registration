@@ -679,6 +679,17 @@ class Config(ConfigBase):
 
         Deliberately narrow rather than `exclude_defaults=True`: that would drop every
         defaulted field at once and move all the existing hashes it is here to preserve.
+
+        **The digest is platform-dependent and is not portable across machines** (P3-12b F64).
+        `data.manifest` and `gt.residual_calibration` dump as paths, and `WindowsPath` serialises
+        with backslashes, so the same experiment hashes differently on the Mac and on the Windows
+        box -- stage F's `flir` x1 cell reads `70c3483ad39e31e3` here and `8783a68fff7395a8`
+        there. The resume guard is unaffected, because `intended_hash` and the recorded hash are
+        always computed on the same machine; what is void is *quoting* a digest from one machine
+        and checking it on another. Normalising with `as_posix()` is not the fix: it would move
+        every hash the server has recorded and make `scripts/stages.py::refuse_a_stale_run` refuse
+        every completed stage directory for a change that alters no science -- the exact failure
+        the exemptions above exist to prevent.
         """
         payload = self.model_dump(mode="json", exclude={"runtime"})
         estimate = payload["estimate"]

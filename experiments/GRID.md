@@ -218,7 +218,7 @@ the only aerial one.
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
-| **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column (**match count → P3-12c**) | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**) |
+| **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column (**match count → P3-12c**) | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**, **ran 2026-09-02**) |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -541,11 +541,16 @@ points, a 2× scale error in the recovered warp that reads as the matcher having
 against a deliberately one-sided implementation to confirm it fails there.
 
 **Quote every row beside the axis's own floor**, as §3's `R` rows and stage E's model rows are.
-At scale `s` a matcher localises to at best ~1 scaled pixel, i.e. `1/s` native pixels. Measured
-on the mono-modal fixture, where nothing else is in the way: `reg/mace` 0.45 px at ×0.5 and
-1.02 px at ×0.25 against ~0.2 px at ×1 — so the floor is real and close to `1/s`. The cheap
-*measured* version on real data is P1-1b's mono-modal control re-run per level (one flag,
-`gt.reference == gt.moving`), and stage F should carry it rather than quoting the bound.
+At scale `s` a matcher localises to at best ~1 *scaled* pixel, which in native pixels is the ×1
+floor divided by `s` — **not `1/s`**, a bound loose by the ×1 floor's own magnitude (P3-12b F61).
+Stage F carries the measured version rather than the bound: P1-1b's mono-modal control re-run per
+level (one flag, `gt.reference == gt.moving`). **Measured 2026-09-02 on `flir`, and the model
+holds**: predicted 0.23 / 0.31 / 0.47 / 0.94 px, `roma` reads 0.21 / 0.27 / 0.42 / 0.98 and
+`matchanything-roma` 0.16 / 0.22 / 0.37 / 0.77, against `1/s`'s prediction of 2 and 4 px. The ×1
+row is the first mono-modal control measured on `flir` — 0.2058 px, agreeing with P1-1b's ~0.20 px
+on `msrs` and `dronevehicle`, so the pipeline's localisation floor is the pipeline's and not the
+dataset's. **No stage-F level is floor-limited**, ×0.25 included (`floor/err` 0.04 → 0.10 against
+a 0.50 threshold), so every resolution row is a statement about the axis.
 
 **Levels: 1.0 / 0.75 / 0.5 / 0.25.** Chosen so they divide 640×512 exactly — an anisotropic
 resize is refused rather than rounded, because `to_native` inverts a single scale and an x/y
@@ -568,6 +573,41 @@ driver carries a separate `FLOOR_CELL` with `composes=False` and
 `tests/test_grid_driver.py::TestStageF` pins the *resolved* config rather than the flags.
 `dronevehicle` has no control cell and its rows are quoted against the `floor(×1)/s` prediction
 instead, with the block naming which of the two each row used.
+
+**What it settled, 2026-09-02** (TASKS.md P3-12b F63-F69). **The axis is real, monotonic, worth
+about 10% of median accuracy at ×0.5 — and `reg/mace` cannot see it.** On `reg/mace` the halved
+level looks free or better (`minima-roma` 7.78 → 7.47 on `flir`, `matchanything-roma`
+14.68 → 13.78 on `dronevehicle`); on `reg/epe_median`, same runs and same pairs, every
+roma-family row degrades monotonically at every level, +13% to +51% by ×0.25. **This is the third
+form of the F33/F34 asymmetry and the one that needs its own sentence.** Stage D's was a method
+that declines pairs; stage E's was a change that shortens the tail without moving the mode;
+stage F's is *a change too small for a mean over successes to resolve at all* — the whole
+distribution shifts by an amount small against the 10 px ladder, so the mean tracks which few
+tail pairs land inside the cut rather than the shift. `xoftr` at ×0.75 on `flir` is the cell that
+shows it whole: `mace` 10.27 → 6.10 → 9.60 across ×1/×0.75/×0.5 while `epe_median` reads
+2.34 → 2.17 → 2.52, the best-looking `flir` cell in the stage and an artefact. **Every later
+driver whose axis may shift the distribution uniformly must print `reg/epe_median` beside
+`reg/mace`** — stage G inherits this the way it inherits F33/F34.
+
+**And the answer to "may later stages run cheap?" is *yes they may, and they should not*.** The
+ranking is resolution-stable (Spearman vs ×1 at ×0.5: 0.905/0.952 on `mace`, 0.898/0.976 on
+`success_rate_10px`), so resolution is a level effect and not an ordering effect — the same shape
+as stage B's polarity answer, and it would license a half-resolution evaluation. The cost block
+withdraws the licence: at ×0.5, where the pixel count is ¼, `roma` pays 0.82-0.85, `minima-roma`
+0.97-0.98, and `superpoint-lightglue` and `xfeat` get *more expensive*. The log names the
+mechanism in passing — `Using coarse resolution (560, 560)` — the dense matchers resample whatever
+they are handed onto a fixed internal grid, so the input level changes the resize and nothing
+else. **`sift` is the control that proves the measurement is real**: it is the one row that tracks
+the pixel count (0.41 at ×0.5, 0.11 at ×0.25), so the flatness of the other seven is
+architectural rather than an instrumentation artefact. Ten percent of median accuracy for 2-18%
+of wall-clock is not a trade, and §1's anchor stays at native resolution.
+
+**One digest caveat that is not a defect.** `config_hash` serialises two `Path` fields, so it
+differs between the Mac and the Windows box by the separator alone (F64): the ×1 `flir` cell is
+`70c3483ad39e31e3` here and `8783a68fff7395a8` there. `refuse_a_stale_run` is unaffected — both
+sides of its comparison are computed on the same machine — but **a digest quoted from one machine
+must never be checked on another**, and a dry-run verification on the Mac verifies the relation
+between hashes, not their values.
 
 Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
 listed to fix its shape, not to be launched.

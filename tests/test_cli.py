@@ -41,6 +41,33 @@ def test_the_upsampling_axis_is_expressible_from_the_command_line() -> None:
     }
 
 
+def test_the_match_count_axis_is_expressible_from_the_command_line() -> None:
+    """P3-12c's stage varies exactly these fields against the anchor config, for the same reason
+    stage C's flags exist: a missing flag forces a second YAML, which is how a stage quietly
+    redefines its own defaults (GRID.md ss1). The caps parse as ints -- a string list would reach
+    pydantic and fail naming a nested config path the caller never wrote."""
+    args = build_parser().parse_args(
+        [
+            "bench",
+            "--sweep-max-matches",
+            "0,256,64",
+            "--sweep-selections",
+            "confidence,random",
+        ]
+    )
+    assert overrides_from_args(args) == {
+        "estimate": {
+            "sweep_max_matches": (0, 256, 64),
+            "sweep_match_selections": ("confidence", "random"),
+        }
+    }
+
+
+def test_a_bad_cap_names_the_flag_not_a_config_path() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["bench", "--sweep-max-matches", "0,many"])
+
+
 def test_gt_writes_records_and_a_config_snapshot(manifest_path: Path, tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     assert (

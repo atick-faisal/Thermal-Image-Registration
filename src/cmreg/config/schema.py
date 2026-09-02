@@ -31,6 +31,24 @@ _HASH_LENGTH = 16
 # re-points (the mistake `warp_model`'s test exists to catch).
 _UNRESIZED = 1.0
 
+# The `EstimateConfig.max_matches` every run before TASKS.md P3-12c implicitly used, and
+# therefore the value `config_hash` drops from its payload. Named for the same reason
+# `_UNRESIZED` is: the exemption and the field's default must be the same value or the exemption
+# silently re-points. **It is also the largest value on its axis** -- "no cap" is more
+# correspondences than any cap -- which is why `_cap_order` below sorts it first under a
+# descending rule rather than last under an ascending one.
+_UNCAPPED = 0
+
+
+def _cap_order(cap: int) -> float:
+    """Sort key for a match cap: ``0`` means *no cap* and is therefore the largest value.
+
+    A module-level function rather than a lambda inside the validator because
+    ``EstimateConfig.variants()`` orders its columns by the identical rule, and two spellings of
+    "which end of this axis is the anchor" is one spelling too many.
+    """
+    return float("inf") if cap == _UNCAPPED else float(cap)
+
 
 class Domain(StrEnum):
     """The three domain families of PLAN.md §1. Reported separately, never pooled: a single
@@ -103,6 +121,23 @@ class Estimator(StrEnum):
     RANSAC = "ransac"
     LMEDS = "lmeds"
     PROSAC = "prosac"
+
+
+class MatchSelection(StrEnum):
+    """How the correspondences fed to the fit are chosen when there are more than
+    ``EstimateConfig.max_matches`` of them (TASKS.md P3-12c).
+
+    Two members rather than one, and the second is not a fallback for the first. ``CONFIDENCE``
+    is the axis as PLAN.md §7 states it -- "number of sampled matches", taken best-first --
+    and ``RANDOM`` is its control: at the same cap the two differ only in *which* matches
+    survive, so a flat comparison between them says the matcher's own ranking is worth nothing
+    at selection time, which is a measurement about the certainty map (PLAN.md §6.2) and not
+    about the count. It also happens to be the only member defined for a backend that scores no
+    matches (``xfeat``; TASKS.md P0-2), which is why the axis is not confidence-only.
+    """
+
+    CONFIDENCE = "confidence"
+    RANDOM = "random"
 
 
 class WarpModel(StrEnum):
@@ -481,6 +516,32 @@ class EstimateConfig(ConfigBase):
     # is not stage E multiplies the run's rows by the model count -- visible in the `warp`
     # column, but a surprise to anyone reading the row count.
     sweep_warp_models: tuple[WarpModel, ...] = ()
+    # --- the P3-12c axis ---------------------------------------------------------------
+    # How many correspondences reach the solver. `0` -- the default -- feeds every one the
+    # matcher returned, which is what every run before P3-12c did.
+    #
+    # **This is not `MatchConfig.max_keypoints` and the two must not be confused.** That one is
+    # the *detector's* budget: it sits upstream of matching, it changes what the matcher does,
+    # and the detector-free backends do not honour it at all (`minima-roma` returns 10 000 under
+    # any budget -- TASKS.md P0-2, and `matchers/vismatch_backend.py` records why). This one is
+    # an input to the *fit*, downstream of the match, defined for every backend, and swept off
+    # one `MatchResult` the way `method` and `warp_model` above are. Failure mode: set on a
+    # config that is not stage F's match-count half, and every row silently reports a fit made
+    # from a fraction of the correspondences the `n_matches` column still shows.
+    max_matches: int = _UNCAPPED
+    # Which correspondences those are, when there are more than `max_matches`. **Inert at
+    # `max_matches = 0`**, where nothing is dropped and the two members select identically --
+    # which is why `variants()` collapses the uncapped column to a single cell rather than
+    # emitting one per selection. Failure mode if that collapse were dropped: two bit-identical
+    # populations in one directory, and every aggregate over the axis double-counts the anchor.
+    match_selection: MatchSelection = MatchSelection.CONFIDENCE
+    # The count half of the axis. Empty means "not swept". `0` is admissible *inside* the sweep
+    # and is the anchor column there.
+    sweep_max_matches: tuple[int, ...] = ()
+    # The ordering half, swept independently -- `sweep_max_matches` alone measures the count and
+    # cannot say whether what it measured was the count or the quality of what survived. Empty
+    # falls back to `match_selection`.
+    sweep_match_selections: tuple[MatchSelection, ...] = ()
 
     @field_validator("threshold_px")
     @classmethod
@@ -531,6 +592,43 @@ class EstimateConfig(ConfigBase):
             raise ValueError(f"sweep_warp_models contains duplicates: {value}")
         return value
 
+    @field_validator("max_matches")
+    @classmethod
+    def _cap_is_usable(cls, value: int) -> int:
+        # `MIN_CORRESPONDENCES[homography]`'s value, restated rather than imported: `warp/` pulls
+        # in numpy and this module is deliberately importable without it. A cap of 1-3 would fail
+        # every pair at `too_few_matches` and report it as a matcher result.
+        if value != _UNCAPPED and value < 4:
+            raise ValueError(f"max_matches must be 0 (no cap) or >= 4, got {value}")
+        return value
+
+    @field_validator("sweep_max_matches")
+    @classmethod
+    def _descending_caps(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        for cap in value:
+            cls._cap_is_usable(cap)
+        if len(set(value)) != len(value):
+            raise ValueError(f"sweep_max_matches contains duplicates: {value}")
+        # **Descending, where `sweep_thresholds_px` is ascending**, and the divergence is the
+        # point rather than an inconsistency. The shared rule is that the swept values become the
+        # columns of a table reaching a human by copy-paste, so their order must not depend on
+        # who wrote the config; the natural reading order here puts the anchor leftmost, as stage
+        # F's x1 / x0.75 / x0.5 / x0.25 does. `0` means *no cap*, i.e. more correspondences than
+        # any cap, so under `_cap_order` it is the largest value and sorts first.
+        if list(value) != sorted(value, key=_cap_order, reverse=True):
+            raise ValueError(
+                "sweep_max_matches must be descending with 0 (no cap) first, got "
+                f"{list(value)}; 0 is the largest value on this axis"
+            )
+        return value
+
+    @field_validator("sweep_match_selections")
+    @classmethod
+    def _unique_selections(cls, value: tuple[MatchSelection, ...]) -> tuple[MatchSelection, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"sweep_match_selections contains duplicates: {value}")
+        return value
+
     @model_validator(mode="after")
     def _anchor_is_inside_the_sweep(self) -> Self:
         """The scalar anchor must be one of the swept cells.
@@ -555,12 +653,28 @@ class EstimateConfig(ConfigBase):
                 f"warp_model {self.warp_model.value!r} must appear in sweep_warp_models "
                 f"{[m.value for m in self.sweep_warp_models]}"
             )
+        if self.sweep_max_matches and self.max_matches not in self.sweep_max_matches:
+            raise ValueError(
+                f"max_matches {self.max_matches} must appear in sweep_max_matches "
+                f"{list(self.sweep_max_matches)}"
+            )
+        if self.sweep_match_selections and self.match_selection not in self.sweep_match_selections:
+            raise ValueError(
+                f"match_selection {self.match_selection.value!r} must appear in "
+                f"sweep_match_selections {[s.value for s in self.sweep_match_selections]}"
+            )
         return self
 
     @property
     def is_sweeping(self) -> bool:
         """True when this config resolves to more than one estimation cell."""
-        return bool(self.sweep_methods or self.sweep_thresholds_px or self.sweep_warp_models)
+        return bool(
+            self.sweep_methods
+            or self.sweep_thresholds_px
+            or self.sweep_warp_models
+            or self.sweep_max_matches
+            or self.sweep_match_selections
+        )
 
     def variants(self) -> tuple[EstimateConfig, ...]:
         """Every estimation cell this config describes, anchor first on each unswept axis.
@@ -573,23 +687,39 @@ class EstimateConfig(ConfigBase):
         models = self.sweep_warp_models or (self.warp_model,)
         methods = self.sweep_methods or (self.method,)
         thresholds = self.sweep_thresholds_px or (self.threshold_px,)
+        caps = self.sweep_max_matches or (self.max_matches,)
+        selections = self.sweep_match_selections or (self.match_selection,)
         # Model-outer, so a swept directory groups by warp model first: that is the order stage
         # E's tables read in, and `eval/runner.py::_rows_for` filters on the columns rather than
-        # on position precisely so the two cannot disagree.
+        # on position precisely so the two cannot disagree. The count axis is innermost for the
+        # same reason -- stage F's match-count half reads matchers down, caps across.
         return tuple(
             self.model_copy(
                 update={
                     "warp_model": model,
                     "method": method,
                     "threshold_px": threshold,
+                    "max_matches": cap,
+                    "match_selection": selection,
                     "sweep_methods": (),
                     "sweep_thresholds_px": (),
                     "sweep_warp_models": (),
+                    "sweep_max_matches": (),
+                    "sweep_match_selections": (),
                 }
             )
             for model in models
             for method in methods
             for threshold in thresholds
+            for cap in caps
+            for selection in selections
+            # **The uncapped column is one cell, not one per selection.** With no cap nothing is
+            # dropped, so the two orderings select the identical correspondences in the identical
+            # order (`estimate/select.py` returns `arange(n)` untouched there) and the cells would
+            # be bit-identical. Same collapse as stage C's x1 kernel column (`GRID.md` §6), and
+            # taken here rather than in a driver because these are variants of *one* run: a
+            # duplicate would double-count the anchor in every aggregate over the axis.
+            if cap != _UNCAPPED or selection is self.match_selection
         )
 
     @property
@@ -604,7 +734,15 @@ class EstimateConfig(ConfigBase):
         prefix three pairs of them would log under one name.
         """
         prefix = "" if self.warp_model is WarpModel.HOMOGRAPHY else f"{self.warp_model.value}/"
-        return f"{prefix}{self.method.value}@{self.threshold_px:g}px"
+        # P3-12c's cap follows the identical rule one axis further out: every run before it was
+        # uncapped, so naming the cap unconditionally would rewrite labels already pasted into
+        # TASKS.md, and the selection is meaningless without a cap to select under.
+        suffix = (
+            ""
+            if self.max_matches == _UNCAPPED
+            else f" n{self.max_matches}/{self.match_selection.value}"
+        )
+        return f"{prefix}{self.method.value}@{self.threshold_px:g}px{suffix}"
 
 
 class Config(ConfigBase):
@@ -671,11 +809,12 @@ class Config(ConfigBase):
         the hash, and a *future* change of the default would silently re-point this exemption --
         which is why the default is named in the test that pins it, not just here.
 
-        **P3-12a's `input_scale` is dropped at `1.0`** under that same scalar rule. It is the
-        third exemption and the last one this pattern should need: a new *axis* that every prior
-        run implicitly sat at one value of has to be absent from the payload at that value, or
-        the resume guard refuses directories whose science did not change. Stages A-E are all
-        `1.0`, so they keep the hashes they were scored under.
+        **P3-12a's `input_scale` is dropped at `1.0`** under that same scalar rule, and
+        **P3-12c's `max_matches` at `0` and `match_selection` at `confidence`** under it again.
+        The pattern generalises rather than being a list of special cases: a new *axis* that
+        every prior run implicitly sat at one value of has to be absent from the payload at that
+        value, or the resume guard refuses directories whose science did not change. Stages A-F
+        sit at all three, so they keep the hashes they were scored under.
 
         Deliberately narrow rather than `exclude_defaults=True`: that would drop every
         defaulted field at once and move all the existing hashes it is here to preserve.
@@ -693,11 +832,30 @@ class Config(ConfigBase):
         """
         payload = self.model_dump(mode="json", exclude={"runtime"})
         estimate = payload["estimate"]
-        for axis in ("sweep_methods", "sweep_thresholds_px", "sweep_warp_models"):
+        for axis in (
+            "sweep_methods",
+            "sweep_thresholds_px",
+            "sweep_warp_models",
+            "sweep_max_matches",
+            "sweep_match_selections",
+        ):
             if not estimate[axis]:
                 del estimate[axis]
         if estimate["warp_model"] == WarpModel.HOMOGRAPHY.value:
             del estimate["warp_model"]
+        # P3-12c's two scalars, the fourth and fifth instances of the same rule, applied exactly
+        # as stated: each is absent at the value every prior run implicitly used. Stages A-F are
+        # uncapped under the default selection, so they keep the hashes they were scored under.
+        # The consequence to accept, and it is the `warp_model` one again: an *uncapped* config
+        # that names `random` hashes apart from one that names `confidence` although the two
+        # select identically, because `match_selection` is inert at `_UNCAPPED`. Making the
+        # exemption conditional on the cap would close that at the price of a second spelling of
+        # the rule, and a rule with two spellings is one the resume guard cannot be checked
+        # against.
+        if estimate["max_matches"] == _UNCAPPED:
+            del estimate["max_matches"]
+        if estimate["match_selection"] == MatchSelection.CONFIDENCE.value:
+            del estimate["match_selection"]
         if payload["preprocess"]["input_scale"] == _UNRESIZED:
             del payload["preprocess"]["input_scale"]
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[

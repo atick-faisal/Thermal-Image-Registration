@@ -29,8 +29,15 @@ do not: ``minima-roma`` returned 10 000 matches under a 2 048 budget because
 all -- its match count comes from its own coarse grid. Not silently capped here: *which*
 matches to drop (top-k by confidence? uniform?) is a methodological choice that belongs to
 P3-12's match-count ablation, and truncating in the adapter would bury it.
-TODO(P3-12): plumb a budget for the detector-free arm, or report the sweep as inapplicable
-to it -- https://github.com/gmberton/vismatch (im_models/minima.py, the missing ``num=``).
+
+**Resolved by P3-12c, and not by plumbing a budget through here.** The axis moved *downstream*
+instead: ``estimate.max_matches`` caps the correspondences fed to the fit
+(``cmreg/estimate/select.py``), which is defined for every backend and costs one solver call
+rather than one match pass, where a per-backend budget would have been inert for exactly the
+three entries above and would have measured matcher cost rather than correspondence count. This
+paragraph stays as the record of why ``max_keypoints`` means different things across the
+registry -- ``vismatch`` upstream is unchanged (im_models/minima.py, the missing ``num=``;
+https://github.com/gmberton/vismatch).
 
 What is *not* adapted: stage-separated timing. ``vismatch``'s ``forward()`` is one call, and
 for a dense matcher extraction and matching are not separable even in principle -- there is no

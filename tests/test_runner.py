@@ -983,3 +983,193 @@ def test_a_matcher_that_raises_costs_one_row_not_the_whole_run(
     assert all(row.height is not None and row.width is not None for row in raised)
     sift = next(summary for summary in summaries if summary.context["matcher"] == "sift")
     assert sift.metrics["reg/success_rate_5px"] > 0.0, "the healthy matcher kept its results"
+
+
+SWEPT_CAPS = (0, 32, 8)
+
+
+def test_the_match_count_axis_names_itself_only_where_it_is_swept(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The same rule as the kernel and the threshold, for P3-12c's two axes.
+
+    Every run before this axis was uncapped, so naming the cap unconditionally would rename every
+    run already on the server. The selection is omitted on the uncapped cell even while it is
+    swept, because `EstimateConfig.variants()` emits that cell once precisely for belonging to
+    both arms -- naming one of them would file it under a single arm.
+    """
+    unswept = base_config(aligned_dataset / "data.yaml", tmp_path / "unswept")
+    assert _variant_label(unswept, unswept.estimate) == "none-none-x1-magsac"
+
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept",
+        estimate={
+            "sweep_max_matches": list(SWEPT_CAPS),
+            "sweep_match_selections": ["confidence", "random"],
+        },
+    )
+    assert [_variant_label(swept, v) for v in swept.estimate.variants()] == [
+        "none-none-x1-magsac-nall",
+        "none-none-x1-magsac-n32-confidence",
+        "none-none-x1-magsac-n32-random",
+        "none-none-x1-magsac-n8-confidence",
+        "none-none-x1-magsac-n8-random",
+    ]
+
+
+def test_a_swept_match_count_run_reproduces_single_cap_runs_row_for_row(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The integrity check for P3-12c, and it needs its own even beside the estimator and warp
+    ones.
+
+    Those two sweep a *parameter* of the fit off one fixed correspondence set. This sweeps the
+    correspondence set itself, which adds a way to be wrong neither can exhibit: an index array
+    applied to two of the three arrays but not the third, or a selection whose order carried over
+    from the previous variant. Either produces a table that looks entirely plausible. Bit-
+    identical, so an order dependence cannot hide inside a tolerance.
+    """
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept_caps",
+        estimate={
+            "sweep_max_matches": list(SWEPT_CAPS),
+            "sweep_match_selections": ["confidence", "random"],
+        },
+    )
+    run_benchmark(swept)
+    swept_rows = read_rows(tmp_path / "swept_caps")
+
+    for variant in swept.estimate.variants():
+        cap, selection = variant.max_matches, variant.match_selection.value
+        single = base_config(
+            aligned_dataset / "data.yaml",
+            tmp_path / f"single_n{cap}_{selection}",
+            estimate={"max_matches": cap, "match_selection": selection},
+        )
+        run_benchmark(single)
+        alone = {row.stem: row for row in read_rows(single.runtime.path)}
+        inside = {
+            row.stem: row
+            for row in swept_rows
+            if row.max_matches == cap and row.match_selection == selection
+        }
+        assert inside.keys() == alone.keys(), f"n{cap}/{selection} lost pairs"
+        for stem, row in inside.items():
+            reference = alone[stem]
+            assert row.corner_err == reference.corner_err
+            assert row.h == reference.h
+            assert row.n_inliers == reference.n_inliers
+            assert row.n_selected == reference.n_selected
+            assert row.inlier_ratio == reference.inlier_ratio
+            assert row.epe_mean == reference.epe_mean
+
+
+def test_the_uncapped_column_reproduces_a_run_made_before_the_axis_existed(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """The property `Config.config_hash`'s P3-12c exemption claims, checked rather than argued.
+
+    At no cap `estimate/select.py` returns `arange(n)` untouched, so the fit sees the matcher's
+    correspondences in the matcher's order -- which is what every stage A-F run did. If that ever
+    became a sorted permutation of the same set, PROSAC's sample order and `inlier_mask`'s
+    indexing would both move while every aggregate still looked plausible, and the exemption
+    would be quietly false.
+    """
+    uncapped = base_config(aligned_dataset / "data.yaml", tmp_path / "uncapped")
+    swept = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "swept_uncapped",
+        estimate={"sweep_max_matches": list(SWEPT_CAPS)},
+    )
+    assert swept.config_hash() != uncapped.config_hash(), "a sweep is a different experiment"
+    run_benchmark(uncapped)
+    run_benchmark(swept)
+
+    alone = {row.stem: row for row in read_rows(tmp_path / "uncapped")}
+    inside = {
+        row.stem: row for row in read_rows(tmp_path / "swept_uncapped") if not row.max_matches
+    }
+    assert inside.keys() == alone.keys()
+    for stem, row in inside.items():
+        assert row.h == alone[stem].h, stem
+        assert row.n_selected == alone[stem].n_matches
+
+
+def test_a_cap_reaches_the_solver_and_is_recorded(aligned_dataset: Path, tmp_path: Path) -> None:
+    """The axis is connected to what it names.
+
+    Without this, a sweep whose columns were identical would be PLAN.md §15A's bug -- a swept
+    knob that never reaches the solver -- in stage F's shape, and every other assertion here
+    would still pass. `n_selected` is checked beside the fit because it is `inlier_ratio`'s
+    denominator and the only column from which a capped row can be reproduced.
+    """
+    cap = 8
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "run",
+        estimate={"sweep_max_matches": [0, cap]},
+    )
+    run_benchmark(config)
+    rows = read_rows(tmp_path / "run")
+
+    capped = [row for row in rows if row.max_matches == cap]
+    assert capped, "the capped column produced no rows"
+    for row in capped:
+        assert row.n_selected is not None
+        assert row.n_selected == min(cap, row.n_matches)
+        assert row.n_inliers <= row.n_selected
+        if row.n_selected:
+            assert row.inlier_ratio == pytest.approx(row.n_inliers / row.n_selected)
+
+    by_stem: dict[str, dict[int | None, list[float] | None]] = {}
+    for row in rows:
+        by_stem.setdefault(row.stem, {})[row.max_matches] = row.h
+    solved_under_both = [
+        (fits[0], fits[cap])
+        for fits in by_stem.values()
+        if fits.get(0) is not None and fits.get(cap) is not None
+    ]
+    assert solved_under_both, "no pair was solved under both caps"
+    assert any(full != short for full, short in solved_under_both), "the cap changed no fit"
+
+
+def test_a_confidenceless_matcher_is_a_hole_in_one_arm_and_a_row_in_the_other(
+    aligned_dataset: Path, tmp_path: Path
+) -> None:
+    """`xfeat`'s column, and the reason the axis carries a random arm at all.
+
+    A confidence-ranked cap cannot be applied to a backend that scores no matches, so that cell
+    is recorded as a row with its own token rather than aborting the variants that ran fine after
+    the matching they all share has been paid for (stage D's F36 in this stage's shape). The
+    random arm has no such requirement and must produce real geometry, which is what keeps the
+    matcher in the stage at all.
+    """
+    _register_confidenceless_matcher("_scoreless_caps")
+    config = base_config(
+        aligned_dataset / "data.yaml",
+        tmp_path / "run",
+        match={"matchers": ["_scoreless_caps"]},
+        estimate={
+            "sweep_max_matches": [0, 8],
+            "sweep_match_selections": ["confidence", "random"],
+        },
+    )
+    run_benchmark(config)
+    rows = read_rows(tmp_path / "run")
+
+    blocked = [row for row in rows if row.max_matches == 8 and row.match_selection == "confidence"]
+    assert blocked
+    assert all(row.failure_reason == "selection_needs_confidence" for row in blocked)
+    assert all(not row.success for row in blocked)
+    # The matching really happened; only the selection could not be made.
+    assert all(row.n_matches > 0 for row in blocked)
+    assert all(row.n_selected == 0 for row in blocked)
+
+    drawn = [row for row in rows if row.max_matches == 8 and row.match_selection == "random"]
+    assert drawn
+    assert any(row.success for row in drawn), "the random arm must run against a scoreless matcher"
+    # The uncapped cell is inert, so it runs for a scoreless matcher exactly as it always has.
+    uncapped = [row for row in rows if not row.max_matches]
+    assert any(row.success for row in uncapped)

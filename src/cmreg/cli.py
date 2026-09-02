@@ -24,6 +24,7 @@ from cmreg.config.schema import (
     Domain,
     Estimator,
     Interpolation,
+    MatchSelection,
     Modality,
     Platform,
     Variant,
@@ -44,6 +45,7 @@ _INTERPOLATIONS = [i.value for i in Interpolation]
 _MODALITIES = [m.value for m in Modality]
 _DOMAINS = [d.value for d in Domain]
 _WARP_MODELS = [m.value for m in WarpModel]
+_SELECTIONS = [s.value for s in MatchSelection]
 _PLATFORMS = [p.value for p in Platform]
 
 # flag name -> dotted path into the config. See convention 2 above.
@@ -68,6 +70,10 @@ _OVERRIDES: dict[str, tuple[str, ...]] = {
     "sweep_thresholds": ("estimate", "sweep_thresholds_px"),
     "warp_model": ("estimate", "warp_model"),
     "sweep_warp_models": ("estimate", "sweep_warp_models"),
+    "max_matches": ("estimate", "max_matches"),
+    "match_selection": ("estimate", "match_selection"),
+    "sweep_max_matches": ("estimate", "sweep_max_matches"),
+    "sweep_selections": ("estimate", "sweep_match_selections"),
     "preprocess_ref": ("preprocess", "reference"),
     "preprocess_mov": ("preprocess", "moving"),
     "upsample": ("preprocess", "moving_upsample"),
@@ -172,6 +178,36 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         type=_comma_separated_floats,
         help="comma-separated inlier thresholds in px to sweep, ascending, e.g. '1,3,5'",
     )
+    # Stage F's downstream axis (P3-12c). Swept by the same machinery as the estimator and the
+    # warp model, and for the same reason: which correspondences are fitted is downstream of
+    # finding them. **Not `--max-keypoints`** -- there is no such flag, because `max_keypoints`
+    # is the detector's budget and the detector-free backends ignore it (P0-2). `--max-matches 0`
+    # is the anchor and feeds every match.
+    parser.add_argument(
+        "--max-matches",
+        dest="max_matches",
+        type=int,
+        help="cap the correspondences fed to the fit (0 = no cap; P3-12c stage F)",
+    )
+    parser.add_argument(
+        "--match-selection",
+        dest="match_selection",
+        choices=_SELECTIONS,
+        help="which matches survive that cap; 'random' is the control arm and the only one "
+        "defined for a matcher that scores no matches",
+    )
+    parser.add_argument(
+        "--sweep-max-matches",
+        dest="sweep_max_matches",
+        type=_comma_separated_ints,
+        help="comma-separated caps to sweep, descending with 0 (no cap) first, e.g. '0,256,64'",
+    )
+    parser.add_argument(
+        "--sweep-selections",
+        dest="sweep_selections",
+        type=_comma_separated,
+        help="comma-separated match selections to sweep, e.g. 'confidence,random' (P3-12c)",
+    )
     parser.add_argument("--preprocess-ref", dest="preprocess_ref", choices=_VARIANTS)
     parser.add_argument("--preprocess-mov", dest="preprocess_mov", choices=_VARIANTS)
     parser.add_argument("--upsample", type=int, help="thermal upsampling factor (1-8)")
@@ -207,6 +243,18 @@ def _comma_separated(value: str) -> tuple[str, ...]:
     single token is far easier to build there than a repeated flag.
     """
     return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _comma_separated_ints(value: str) -> tuple[int, ...]:
+    """``--sweep-max-matches 0,256,64`` -> ``(0, 256, 64)``.
+
+    Parsed here rather than left to pydantic for the same reason the float version is: a typo
+    names the flag and the offending token, not a nested config path a caller never wrote.
+    """
+    try:
+        return tuple(int(item) for item in _comma_separated(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r}: expected comma-separated integers") from exc
 
 
 def _comma_separated_floats(value: str) -> tuple[float, ...]:

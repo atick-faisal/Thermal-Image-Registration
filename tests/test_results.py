@@ -42,6 +42,9 @@ def make_row(
         estimator="magsac",
         threshold_px=3.0,
         warp="homography",
+        max_matches=0,
+        match_selection="confidence",
+        n_selected=40,
         moving="thermal",
         reference="optical",
         seed=0,
@@ -254,3 +257,51 @@ def test_a_file_missing_a_required_column_is_still_refused(tmp_path: Path) -> No
     pq.write_table(pq.read_table(path).drop_columns(["matcher"]), path)
     with pytest.raises(ResultsError, match="matcher"):
         read_rows(path)
+
+
+def test_a_file_predating_the_match_count_columns_reads_as_null(tmp_path: Path) -> None:
+    """P3-12c's three columns, checked as a set rather than trusted to the general rule above.
+
+    Every stage A-F file on the server was written before them, and all three are `X | None`
+    precisely so those files keep reading. Null here means "written before this axis existed" --
+    not "uncapped", which is what they in fact ran at: writing 0 into them would be inventing a
+    value the file never recorded, exactly as P3-12a decided for `input_scale`.
+    """
+    import pyarrow.parquet as pq
+
+    added = ["max_matches", "match_selection", "n_selected"]
+    path = write_rows([make_row("a"), make_row("b")], tmp_path)
+    pq.write_table(pq.read_table(path).drop_columns(added), path)
+
+    rows = read_rows(path)
+    assert len(rows) == 2
+    assert all(row.max_matches is None for row in rows)
+    assert all(row.match_selection is None for row in rows)
+    assert all(row.n_selected is None for row in rows)
+    assert rows[0].corner_err == pytest.approx(2.0)
+
+
+def test_a_capped_block_says_which_cell_it_is() -> None:
+    """The context block is how a pasted result identifies itself. The line appears only when
+    the fit was capped, so every block already pasted into TASKS.md re-renders unchanged."""
+    uncapped = summarize([make_row("a")], THRESHOLDS)
+    assert "matches" not in uncapped.context
+    capped = summarize(
+        [make_row("a", max_matches=256, match_selection="random", n_selected=256)], THRESHOLDS
+    )
+    assert capped.context["matches"] == "256 by random"
+
+
+def test_caps_of_one_matcher_are_labelled_by_the_cap() -> None:
+    """P3-12c repeats the matcher across thirteen cells, so the cap has to reach the label --
+    otherwise a re-rendered stage-F table has thirteen rows nobody can tell apart."""
+    summaries = [
+        summarize([make_row("a", matcher="sift")], THRESHOLDS),
+        summarize(
+            [make_row("a", matcher="sift", max_matches=64, n_selected=64)],
+            THRESHOLDS,
+        ),
+    ]
+    table = render_comparison(summaries, ("reg/mace",))
+    assert "sift [homography/magsac @ 3px]" in table
+    assert "sift [homography/magsac @ 3px/64 by confidence]" in table

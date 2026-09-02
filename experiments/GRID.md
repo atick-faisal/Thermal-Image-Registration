@@ -21,7 +21,7 @@ file and the axis named in it.
 | preprocess | `invert` / `percentile` (2/98), ×1 bicubic | the recipe all three sibling implementations converged on (PLAN.md §15B). **Stage B measured the polarity as non-optimal on 3 of 4 datasets** and it stays anyway — see below. **Stage C measured the ×1** and it is the right factor, so the two halves of this row carry opposite caveats |
 | estimator | MAGSAC @ 3 px, 10 000 iters, conf 0.9999 | P3-3's default, **and the one field stage D measured and left where it was** (P3-10 F33/F35): MAGSAC is best or tied on the failure-inclusive metric in 15 of 16 (matcher, dataset) cells, and its own threshold row is flat inside the seed noise, so the 3 px is a free choice rather than a tuned one. Frozen for stages E-G on that basis. The 3 px here is the *estimator inlier* threshold and is unrelated to §2's reporting ladder |
 | warp model | homography | **the only one that can reach zero error against this ground truth**, which P3-4a turned from an implementation fact into a measured one. Tier-1 samples a projective warp, so the restricted models carry a floor: on a 640-wide set the best possible affine is **11.17 px** and the best possible similarity **15.57 px** (P3-4a F40, corrected by F45). The anchor is the only cell of the axis that is not floored above the reporting ladder |
-| `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget (`TODO(P3-12)`) |
+| `max_keypoints` | 4096 | not honoured by the detector-free backends — `minima-roma` returns 10 000 under any budget. **P3-12c settled what follows from that**: the match-count axis is *not* expressed through this field but through `estimate.max_matches`, which caps the correspondences fed to the fit and is defined for every backend (§6, stage F′). This row stays a matcher-side budget with a known hole, and no stage varies it |
 | seed | 0 | one seed outside stage D; see §5 |
 
 `experiments/p3a_baseline_grid.yaml` **is** this cell, in the config schema, and every later
@@ -218,7 +218,8 @@ the only aerial one.
 | **C** | upsample ×1/2/3/4 × 4 kernels | reduced-8 / responsive-4 | driving+aerial | **26** | 1 | P3-9 |
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
-| **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column (**match count → P3-12c**) | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**, **ran 2026-09-02**) |
+| **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**, **ran 2026-09-02**) |
+| **F′** | match count × {confidence, random} (**downstream**) | reduced-8 | driving+aerial | **13 (2 match passes)** | 1 | P3-12c (axis **P3-12c-a**, driver **P3-12c-b**) |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -608,6 +609,51 @@ differs between the Mac and the Windows box by the separator alone (F64): the ×
 sides of its comparison are computed on the same machine — but **a digest quoted from one machine
 must never be checked on another**, and a dry-run verification on the Mac verifies the relation
 between hashes, not their values.
+
+### Stage F′: the match-count half, and why it is a separate stage
+
+The other half of P3-12, split off when P3-12b was authored and landed as **P3-12c-a**
+(2026-09-02). Stage F resizes the images and therefore pays one match pass per level; this axis
+subsamples the *correspondences* between matching and estimation, so thirteen cells cost **two
+match passes** — one per dataset — exactly as stages D and E do. Bundling them would have put two
+cost models and two questions in one table.
+
+**"Match count" means the correspondences fed to the fit, not the matcher's own budget**, and
+that reading is forced rather than chosen (P3-12c F70). `MatchConfig.max_keypoints` is not
+honoured by the detector-free backends — `minima-roma` returns 10 000 under a 2 048 budget,
+`matchanything-roma` has no budget at all — so an axis expressed through it is flat for half of
+reduced-8 for a reason that is not the number of matches, and the half that does respond answers
+a different question (a cheaper matcher) from the half that does not. `estimate.max_matches` is
+defined for every backend. The two fields are documented against each other in both places,
+because a reader who confuses them reads the row as being about matcher cost.
+
+**Two orderings, and the second is stage E's control column in this stage's shape.** `confidence`
+takes the top-N by the matcher's own per-match score; `random` takes a seeded prefix of a
+permutation. At equal cap they differ only in *which* matches survive, so the comparison measures
+whether the certainty map identifies geometrically good correspondences — PLAN.md §6.2's baseline
+probed for free, and a negative row under X-4 if the two agree. `random` is also the only arm
+defined for `xfeat`, alone in reduced-8 in scoring no matches (P0-2); its confidence cells are
+recorded as rows carrying `selection_needs_confidence`, distinct from stage D's
+`estimator_needs_confidence` even though the missing signal is the same one.
+
+**Thirteen cells, not fourteen.** At no cap nothing is dropped, so the two orderings select
+identically and the uncapped column collapses to one cell — the same collapse stage C's ×1 kernel
+column has, taken in `EstimateConfig.variants()` because these are variants of one run and a
+duplicate would double-count the anchor in every aggregate.
+
+**Choosing the caps is the driver's open question and is not free.** A cap above a matcher's yield
+is inert by construction — it must be, or the axis's widest columns would differ from the anchor
+by a reordering rather than by a count — and reduced-8's yields span two orders of magnitude
+(P0-2: `minima-roma` 10 000 against `sift-nn` 113 on one pair). One absolute ladder is therefore
+inert at the top for the sparse arm and never reaches the anchor for the dense one. A per-matcher
+fraction is the alternative and is a *different measurement*: absolute caps measure a fixed
+correspondence budget, fractions measure decimation. Settle it in the driver, with stage A's own
+`match/total` column in hand.
+
+**Two inherited reporting rules, both non-optional here.** `reg/epe_median` prints beside
+`reg/mace`, because a cap is precisely the kind of change that shifts the whole distribution by an
+amount a mean over successes cannot resolve (stage F's F63); and the aggregate blocks render once
+per metric over the matchers every column solved (F34, F37).
 
 Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
 listed to fix its shape, not to be launched.

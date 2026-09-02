@@ -80,6 +80,19 @@ class PairRow:
     estimator: str
     threshold_px: float
     warp: str
+    # Stage F's match-count axis (TASKS.md P3-12c): the cap on how many correspondences reached
+    # the solver, and which ones. `0` is "no cap"; null means "written before this axis existed",
+    # which is every stage A-F file on the server and is why both are nullable (the P2-12 rule).
+    # Per row rather than per run, unlike `input_scale` above: this axis is *downstream* of the
+    # matcher, so a cap costs one `cv2.findHomography` call off a shared `MatchResult` and a
+    # single run directory holds every cap.
+    max_matches: int | None
+    match_selection: str | None
+    # How many correspondences the solver actually saw -- `min(max_matches, n_matches)`, or
+    # `n_matches` when uncapped. Carried separately because it is the denominator of
+    # `inlier_ratio` below and `n_matches` is not: without it a capped row's inlier ratio cannot
+    # be reproduced from the file.
+    n_selected: int | None
     moving: str
     # The reference modality. Without it a mono-modal control row (TASKS.md P1-1b, where both
     # sides come from one modality) is indistinguishable from a benchmark row in this file.
@@ -121,8 +134,13 @@ class PairRow:
     # "looked and found nothing", which is the distinction the column exists for.
     n_detected_ref: int | None
     n_detected_mov: int | None
+    # The matcher's own yield, **not** what was fitted. Unchanged by P3-12c's cap on purpose:
+    # `match/total` is a property of the matcher and stage A's column has to keep meaning what it
+    # meant. `n_selected` above is what reached the solver.
     n_matches: int
     n_inliers: int
+    # Inliers over `n_selected`, not over `n_matches`. The two are equal on every uncapped row --
+    # which is everything measured before P3-12c -- and diverge exactly where the cap bites.
     inlier_ratio: float
     reproj_err: float | None
     extract_ms: float

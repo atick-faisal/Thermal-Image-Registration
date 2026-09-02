@@ -108,6 +108,14 @@ def summarize(rows: Sequence[PairRow], thresholds_px: Sequence[float]) -> Summar
             f"x{first.upsample} {first.interpolation}"
         ),
         "warp": first.warp,
+        # Only when the fit was capped (TASKS.md P3-12c). Unconditional, it would add a line
+        # reading "all matches" to every block already pasted into TASKS.md, and a context block
+        # that drifts between stages is one nobody can read across them.
+        **(
+            {}
+            if not first.max_matches
+            else {"matches": f"{first.max_matches} by {first.match_selection}"}
+        ),
         # Both sides, always: when they name the same modality the block is a P1-1b
         # mono-modal control and not a cross-modal benchmark row, and a pasted block has
         # nothing else to say so.
@@ -170,15 +178,22 @@ def _row_names(summaries: Sequence[Summary]) -> list[str]:
 
     The matcher alone, whenever the matchers are distinct -- which is every stage A-C table, and
     what keeps those blocks byte-identical to the ones already pasted into TASKS.md. A run that
-    sweeps *within* a matcher (P3-10's estimator, P3-4a's warp model) repeats it, and a table
-    whose rows cannot be told apart is worse than no table: this block is how results reach the
-    Mac from the training server, and a reader cannot ask it which row was which.
+    sweeps *within* a matcher (P3-10's estimator, P3-4a's warp model, P3-12c's match cap) repeats
+    it, and a table whose rows cannot be told apart is worse than no table: this block is how
+    results reach the Mac from the training server, and a reader cannot ask it which row was
+    which.
+
+    The cap joins the label **only when it is present in the summaries**, for the same reason
+    ``eval/runner.py::_variant_label`` names an axis only where it is varied: appending it
+    unconditionally would rewrite every stage-D and stage-E row name already pasted.
     """
     matchers = [str(summary.context["matcher"]) for summary in summaries]
     if len(set(matchers)) == len(matchers):
         return matchers
     return [
-        f"{matcher} [{summary.context['warp']}/{summary.context['estimator']}]"
+        f"{matcher} [{summary.context['warp']}/{summary.context['estimator']}"
+        + (f"/{matches}" if (matches := summary.context.get("matches")) else "")
+        + "]"
         for matcher, summary in zip(matchers, summaries, strict=True)
     ]
 

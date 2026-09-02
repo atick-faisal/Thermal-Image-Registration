@@ -14,6 +14,7 @@ from cmreg.config import (
     Domain,
     EstimateConfig,
     Estimator,
+    MatchSelection,
     Platform,
     PreprocessConfig,
     WarpModel,
@@ -298,3 +299,94 @@ def test_an_empty_sweep_leaves_config_hash_where_it_was() -> None:
 def test_a_sweep_is_a_different_experiment() -> None:
     swept = Config(estimate=EstimateConfig(sweep_methods=(Estimator.MAGSAC, Estimator.LMEDS)))
     assert swept.config_hash() != Config().config_hash()
+
+
+def test_the_match_count_is_the_fourth_and_fifth_axes_of_the_same_sweep() -> None:
+    """P3-12c. Caps innermost, so a swept directory reads matchers down, caps across -- and the
+    **uncapped column is one cell**, because with nothing to drop the two selections choose
+    identically and a second copy of it would double-count the anchor in every aggregate."""
+    config = EstimateConfig(
+        sweep_max_matches=(0, 64),
+        sweep_match_selections=(MatchSelection.CONFIDENCE, MatchSelection.RANDOM),
+    )
+    assert [(v.max_matches, v.match_selection.value) for v in config.variants()] == [
+        (0, "confidence"),
+        (64, "confidence"),
+        (64, "random"),
+    ]
+
+
+def test_the_uncapped_cell_carries_the_configs_own_selection() -> None:
+    """The collapse keeps the *anchor's* selection, not the first of the swept list, so the
+    printed console block belongs to a column of the stage's table (`_publish`'s anchor)."""
+    config = EstimateConfig(
+        match_selection=MatchSelection.RANDOM,
+        sweep_max_matches=(0, 64),
+        sweep_match_selections=(MatchSelection.RANDOM, MatchSelection.CONFIDENCE),
+    )
+    uncapped = [v for v in config.variants() if v.max_matches == 0]
+    assert [v.match_selection for v in uncapped] == [MatchSelection.RANDOM]
+
+
+def test_the_default_config_hash_is_unchanged_by_the_match_count_fields() -> None:
+    """The P3-12c exemptions, the fourth and fifth instances of the scalar rule.
+
+    Two more always-valued scalars, so without the exemptions stage F's second half would move
+    every hash in the project and `scripts/stages.py::refuse_a_stale_run` would refuse every
+    completed stage A-F directory on the server for a change that altered no science. The literal
+    is the hash those directories were scored under and must not move again; asserting the
+    defaults beside it is the point at which the exemption would otherwise silently re-point.
+    """
+    assert EstimateConfig().max_matches == 0
+    assert EstimateConfig().match_selection is MatchSelection.CONFIDENCE
+    assert Config().config_hash() == "04f02efbd8b566ed"
+
+
+def test_a_capped_fit_hashes_apart() -> None:
+    """The property the resume guard needs: a run fitted from 256 correspondences is a different
+    experiment from one fitted from all of them."""
+    default = Config()
+    capped = default.model_copy(
+        update={"estimate": default.estimate.model_copy(update={"max_matches": 256})}
+    )
+    assert capped.config_hash() != default.config_hash()
+
+
+def test_swept_caps_are_descending_with_no_cap_first() -> None:
+    """Deliberately the opposite order to `sweep_thresholds_px`, because `0` means *no cap* and
+    is therefore the largest value on this axis: the anchor column reads leftmost, as stage F's
+    x1 does. Ascending would put the anchor at the far end of the table."""
+    assert EstimateConfig(sweep_max_matches=(0, 256, 64)).variants()
+    with pytest.raises(ValidationError):
+        EstimateConfig(max_matches=64, sweep_max_matches=(64, 256, 0))
+    with pytest.raises(ValidationError):
+        EstimateConfig(max_matches=0, sweep_max_matches=(256, 0, 64))
+    with pytest.raises(ValidationError):
+        EstimateConfig(max_matches=64, sweep_max_matches=(64, 64))
+
+
+def test_a_cap_below_the_minimal_sample_is_refused() -> None:
+    """A cap of 1-3 fails every pair at `too_few_matches` and reports it as a matcher result."""
+    for value in (1, 3, -1):
+        with pytest.raises(ValidationError):
+            EstimateConfig(max_matches=value)
+
+
+def test_the_match_count_anchor_must_be_one_of_the_swept_cells() -> None:
+    with pytest.raises(ValidationError):
+        EstimateConfig(max_matches=128, sweep_max_matches=(0, 256, 64))
+    with pytest.raises(ValidationError):
+        EstimateConfig(
+            match_selection=MatchSelection.CONFIDENCE,
+            sweep_match_selections=(MatchSelection.RANDOM,),
+        )
+
+
+def test_a_capped_variant_names_itself() -> None:
+    """The label is a console header and a W&B token; two cells sharing one is X-2's failure."""
+    assert EstimateConfig().label == "magsac@3px"
+    assert EstimateConfig(max_matches=256).label == "magsac@3px n256/confidence"
+    assert (
+        EstimateConfig(max_matches=256, match_selection=MatchSelection.RANDOM).label
+        == "magsac@3px n256/random"
+    )

@@ -12,13 +12,21 @@ from cmreg.estimate.robust import (
     supports,
     symmetric_reprojection_error,
 )
+from cmreg.estimate.select import (
+    NEEDS_CONFIDENCE_REASON,
+    needs_confidence,
+    selected_indices,
+)
 
 __all__ = [
+    "NEEDS_CONFIDENCE_REASON",
     "SUPPORTED_ESTIMATORS",
     "UNSUPPORTED_REASON",
     "Estimate",
     "EstimateError",
     "estimate_warp",
+    "needs_confidence",
+    "selected_indices",
     "supports",
     "symmetric_reprojection_error",
 ]

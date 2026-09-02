@@ -65,6 +65,15 @@ estimator axis in one way that shows up in the rows -- not every estimator can f
 OpenCV's 4-DoF ``estimateAffinePartial2D`` accepts only RANSAC and LMEDS, so a sweep spanning
 both axes has holes, and they are recorded as rows (``_unsupported``) rather than aborted.
 
+**The number of correspondences fed to the fit is a fourth and fifth axis of that same sweep**
+(TASKS.md P3-12c). Which matches reach the solver is downstream of finding them, so a cap costs
+one more solver call off the pair's single ``MatchResult``. It is deliberately not
+``MatchConfig.max_keypoints``, which is the *detector's* budget and is not honoured by the
+detector-free backends at all (TASKS.md P0-2); ``estimate/select.py`` states that argument in
+full. Two orderings are swept, top-N by confidence and a seeded nested random prefix, because at
+equal cap they differ only in which matches survive -- so a flat comparison between them is a
+measurement about the matcher's certainty rather than about the count.
+
 That equivalence rests on one measured property: **OpenCV's robust estimators are
 deterministic and carry no RNG state between calls.** Repeated fits on identical input are
 bit-identical and ``cv2.setRNGSeed`` does not move them (opencv 5.0.0), so variant *k*'s result
@@ -87,7 +96,16 @@ import numpy as np
 from cmreg.config import Config, EstimateConfig, Estimator, Modality
 from cmreg.data import DatasetManifest, select_pairs
 from cmreg.device import resolve_device
-from cmreg.estimate import UNSUPPORTED_REASON, Estimate, EstimateError, estimate_warp, supports
+from cmreg.estimate import (
+    NEEDS_CONFIDENCE_REASON,
+    UNSUPPORTED_REASON,
+    Estimate,
+    EstimateError,
+    estimate_warp,
+    needs_confidence,
+    selected_indices,
+    supports,
+)
 from cmreg.gt import (
     DenseGT,
     ResidualCalibration,
@@ -102,7 +120,7 @@ from cmreg.matchers import MatchResult, get_matcher
 from cmreg.metrics import corner_error, diagonal, endpoint_error
 from cmreg.preprocess import GrayImage, Preprocessed, preprocess_moving, preprocess_reference
 from cmreg.results import PairRow, Summary, render, render_comparison, summarize, write_rows
-from cmreg.seeding import seed_cell
+from cmreg.seeding import cell_seed, seed_cell
 from cmreg.tracking import RunTracker, git_sha, run_name, run_tags
 from cmreg.warp import WarpError, apply_warp
 
@@ -263,8 +281,10 @@ def run_benchmark(config: Config) -> tuple[Summary, ...]:
 def _rows_for(rows: Sequence[PairRow], matcher: str, variant: EstimateConfig) -> list[PairRow]:
     """The rows of one (matcher, estimation variant) cell.
 
-    Filtered on the three *columns* rather than on position, so this is the same grouping
-    `cmreg report` applies when it re-renders the file with no config in hand.
+    Filtered on the five *columns* rather than on position, so this is the same grouping
+    `cmreg report` applies when it re-renders the file with no config in hand. All five, not the
+    three of P3-10/P3-4a: without the P3-12c pair a swept directory's caps pool into one
+    population and every metric is an average over the axis it was meant to resolve.
     """
     return [
         row
@@ -273,6 +293,8 @@ def _rows_for(rows: Sequence[PairRow], matcher: str, variant: EstimateConfig) ->
         and row.warp == variant.warp_model.value
         and row.estimator == variant.method.value
         and row.threshold_px == variant.threshold_px
+        and row.max_matches == variant.max_matches
+        and row.match_selection == variant.match_selection.value
     ]
 
 
@@ -449,36 +471,52 @@ def _evaluate(
     kpts_reference = pair.reference.to_native(result.kpts0)
     kpts_moving = moving.to_native(result.kpts1)
 
+    # P3-12c's key, the same one `seed_cell` above used. Resolved here rather than inside the
+    # loop so every cap of a (pair, matcher) draws the *one* permutation it takes prefixes of --
+    # which is what makes the caps nested and the axis a sweep rather than seven unrelated draws.
+    selection_seed = cell_seed(config.gt.seed, index, name)
+
     rows: list[PairRow] = []
     for variant in variants:
         blocked = _unsupported(variant, result)
         if blocked is not None:
             rows.append(_unsupported_row(pair, name, variant, identity, result, reported, blocked))
             continue
+        # Subsampled *after* the mapping back to native pixels and *before* the fit, which is the
+        # whole of P3-12c: the axis is downstream of the matcher, so a cap costs one solver call
+        # off this pair's single `MatchResult` rather than a match pass of its own. All three
+        # arrays are sliced by the one index array, or the correspondences stop corresponding.
+        chosen = selected_indices(len(result), result.confidence, variant, selection_seed)
+        confidence = None if result.confidence is None else result.confidence[chosen]
         start = time.perf_counter()
         # src is the warped moving image, dst is the reference: the estimate must map the
         # moving image back into the reference frame, which is the direction `truth` describes.
-        estimate = estimate_warp(kpts_moving, kpts_reference, variant, result.confidence)
+        estimate = estimate_warp(kpts_moving[chosen], kpts_reference[chosen], variant, confidence)
         estimate_ms = (time.perf_counter() - start) * 1e3
-        rows.append(_row(pair, name, variant, identity, result, estimate, estimate_ms))
+        rows.append(_row(pair, name, variant, identity, result, estimate, estimate_ms, len(chosen)))
     return rows
 
 
 def _unsupported(variant: EstimateConfig, result: MatchResult) -> str | None:
     """The reason this variant cannot run against this match, or ``None`` if it can.
 
-    Two causes, deliberately distinguished by their tokens because they have different owners.
+    Three causes, deliberately distinguished by their tokens because they have different owners.
     ``estimator_needs_confidence`` is a property of the **matcher** -- PROSAC orders its minimal
     samples by score and three ``vismatch`` backends return none (TASKS.md P0-2) -- and can
     differ pair to pair in principle. ``estimator_unsupported_for_warp`` is a property of the
     **(model, estimator) pair alone**: OpenCV cannot fit a 4-DoF similarity by any USAC method
-    (TASKS.md P3-4a), whatever the matcher supplied. Collapsing them into one token would make a
-    stage-E hole indistinguishable from a stage-D one in the results store.
+    (TASKS.md P3-4a), whatever the matcher supplied. ``selection_needs_confidence`` is P3-12c's
+    and rests on the same missing signal as the first, but belongs to the **selector** rather
+    than to the estimator: a confidence-ranked cap against a scoreless matcher. Collapsing any
+    two of them into one token would make a hole from one stage indistinguishable from another's
+    in the results store, which is exactly what stage E's F51 had to unpick.
     """
     if not supports(variant.warp_model, variant.method):
         return UNSUPPORTED_REASON
     if variant.method is Estimator.PROSAC and result.confidence is None:
         return "estimator_needs_confidence"
+    if needs_confidence(variant, result.confidence):
+        return NEEDS_CONFIDENCE_REASON
     return None
 
 
@@ -503,16 +541,21 @@ def _unsupported_row(
     warning fires once per (matcher, warp model, estimator), not 300 times into a console that
     reaches the Mac by copy-paste.
     """
-    key = (matcher, f"{variant.warp_model.value}/{variant.method.value}")
+    # The selection is part of the key, not only the estimator and model: P3-12c's hole is one
+    # per (matcher, selection) and folding it into an estimator key would report the first cap
+    # and silence the rest, leaving five capped cells unexplained in a console that reaches the
+    # Mac by copy-paste.
+    key = (matcher, f"{variant.warp_model.value}/{variant.method.value}/{variant.label}")
     if key not in reported:
         reported.add(key)
         logger.warning(
-            "%s cannot be fitted here: %s (matcher %s, warp %s); recording every pair of that "
-            "cell as '%s'",
+            "%s cannot be fitted here: %s (matcher %s, warp %s, cell %s); recording every pair "
+            "of that cell as '%s'",
             variant.method.value,
             reason,
             matcher,
             variant.warp_model.value,
+            variant.label,
             reason,
         )
     # Built through `_row` from a failed `Estimate` rather than through `_failed_row`, because
@@ -528,7 +571,10 @@ def _unsupported_row(
         reproj_err=float("nan"),
         failure_reason=reason,
     )
-    return _row(pair, matcher, variant, identity, result, unsupported, estimate_ms=0.0)
+    # `n_selected=0`: the matching happened and its counts are honest, but nothing reached the
+    # solver, and recording the cap it *would* have fed would put a number in the denominator
+    # column of a fit that never ran.
+    return _row(pair, matcher, variant, identity, result, unsupported, 0.0, n_selected=0)
 
 
 def _row(
@@ -539,6 +585,7 @@ def _row(
     result: MatchResult,
     estimate: Estimate,
     estimate_ms: float,
+    n_selected: int,
 ) -> PairRow:
     corner_err: float | None = None
     epe_mean: float | None = None
@@ -568,6 +615,9 @@ def _row(
         warp=variant.warp_model.value,
         estimator=variant.method.value,
         threshold_px=variant.threshold_px,
+        max_matches=variant.max_matches,
+        match_selection=variant.match_selection.value,
+        n_selected=n_selected,
         success=estimate.h is not None,
         failure_reason=failure_reason,
         overlap=pair.overlap,
@@ -615,6 +665,12 @@ def _failed_row(
         warp=variant.warp_model.value,
         estimator=variant.method.value,
         threshold_px=variant.threshold_px,
+        max_matches=variant.max_matches,
+        match_selection=variant.match_selection.value,
+        # Nothing was matched, so nothing was selected. Zero rather than null: null on these
+        # columns means "written before the axis existed" (`results/store.py`), and this row was
+        # written after it.
+        n_selected=0,
         success=False,
         failure_reason=reason,
         overlap=float("nan"),
@@ -672,6 +728,18 @@ def _variant_label(config: Config, variant: EstimateConfig) -> str:
     label += f"-{variant.method.value}"
     if config.estimate.sweep_thresholds_px:
         label += f"@{variant.threshold_px:g}px"
+    # P3-12c's two, the fifth and sixth instances of the rule. Every run before them was uncapped,
+    # so naming the cap unconditionally would rename every run already in W&B; swept, the thirteen
+    # cells would otherwise collide into one run name and X-2's traceability with them. `nall` and
+    # not `n0`, because the axis's anchor is "every match" and a reader should not have to know
+    # that 0 spells it.
+    if config.estimate.sweep_max_matches:
+        label += f"-n{'all' if variant.max_matches == 0 else variant.max_matches}"
+    if config.estimate.sweep_match_selections and variant.max_matches != 0:
+        # Omitted on the uncapped cell, which `EstimateConfig.variants()` emits once precisely
+        # because the selections are indistinguishable there: naming one of them would file a
+        # cell that belongs to both columns under a single arm's name.
+        label += f"-{variant.match_selection.value}"
     return label
 
 
@@ -693,7 +761,16 @@ def _publish(
     unswept run prints, so a non-sweep run's output is unchanged and a stage driver renders the
     sweep's own tables from Parquet (`scripts/p3d_estimator.py`), as stage C does.
     """
-    anchor = config.estimate.warp_model, config.estimate.method, config.estimate.threshold_px
+    # Five fields since P3-12c, and the count matters: with the cap left out, all seven of a
+    # match-count sweep's caps match the anchor triple and print a console block each, which is
+    # seven times the paste this channel exists to keep readable.
+    anchor = (
+        config.estimate.warp_model,
+        config.estimate.method,
+        config.estimate.threshold_px,
+        config.estimate.max_matches,
+        config.estimate.match_selection,
+    )
     printed: list[Summary] = []
     for variant, summary in zip(variants, summaries, strict=True):
         matcher = summary.context["matcher"]
@@ -724,10 +801,18 @@ def _publish(
                 "cell/warp": variant.warp_model.value,
                 "cell/estimator": variant.method.value,
                 "cell/threshold_px": variant.threshold_px,
+                "cell/max_matches": variant.max_matches,
+                "cell/match_selection": variant.match_selection.value,
             },
         ) as tracker:
             tracker.log(summary.metrics)
-        if (variant.warp_model, variant.method, variant.threshold_px) == anchor:
+        if (
+            variant.warp_model,
+            variant.method,
+            variant.threshold_px,
+            variant.max_matches,
+            variant.match_selection,
+        ) == anchor:
             printed.append(summary)
 
     for summary in printed:

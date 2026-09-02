@@ -20,9 +20,15 @@ import p3c_upsample
 import p3d_estimator
 import p3e_warp
 import p3f_resolution
+import p3g_matchcount
 import stages
-from cmreg.metrics.schema import FAILURE_RATE
-from cmreg.results import write_rows
+from cmreg.metrics.schema import (
+    EPE_MEDIAN,
+    FAILURE_RATE,
+    MATCH_INLIER_RATIO,
+    TIME_ESTIMATE_MS,
+)
+from cmreg.results import PairRow, write_rows
 from tests.test_results import make_row
 
 
@@ -927,3 +933,309 @@ def _res_errors(
         p3f_resolution.label_for(level): dict.fromkeys(matchers, value)
         for level, value in median.items()
     }
+
+
+class TestStageG:
+    """`scripts/p3g_matchcount.py` (P3-12c-b). The stage whose widest columns must be the anchor.
+
+    Four things are pinned here. The **cell shape**, because the uncapped column collapses to one
+    cell and a driver expecting eighteen would render a permanent `--` that reads as a failed
+    cell. The **ladder**, because it was chosen against stage A's measured yields rather than
+    P0-2's single-pair probe, and a ladder that stops at 64 makes `sift` an all-anchor row. The
+    **`config_hash` relation**, because P3-12c's two scalars are dropped at their anchor values
+    and `refuse_a_stale_run` needs a swept directory to hash apart from an unswept one. And the
+    **integrity block's arithmetic**, which is this stage's silent failure: if an inert cap
+    reorders instead of reproducing, every wide column above it is a permutation rather than a
+    count and each one still looks entirely plausible.
+    """
+
+    def test_the_stage_is_two_match_passes_carrying_seventeen_variants(self) -> None:
+        """GRID.md §6: the axis sits **downstream** of the matcher, so seventeen cells cost one
+        match pass per dataset -- the economics of stages D and E, not of stage F. Seventeen and
+        not eighteen: with no cap the two orderings select identically, so `EstimateConfig.
+        variants()` emits the uncapped cell once (F75) and `columns()` mirrors it."""
+        dirs = [
+            p3g_matchcount.run_dir_for(cell)
+            for cell in stages.CELLS
+            if cell.dataset in p3g_matchcount.DATASETS
+        ]
+        assert len(dirs) == 2
+        assert len(set(dirs)) == len(dirs)
+        columns = p3g_matchcount.columns()
+        assert len(columns) == 17
+        assert len(set(columns)) == len(columns)
+        assert [cap for cap, _ in columns].count(0) == 1
+
+    def test_the_invocation_resolves_to_the_seventeen_variants_over_reduced_eight(self) -> None:
+        """Resolved through `cmreg`'s own parser and override table rather than by rebuilding
+        the config here: a second path to the same answer is a second path that can disagree
+        with the run it describes. The four settled axes are asserted *across every variant*,
+        because the stage's whole claim is that only the match count moves."""
+        from cmreg.cli import build_parser, overrides_from_args
+        from cmreg.config import Config
+
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        args = build_parser().parse_args(p3g_matchcount.argv_for(cell))
+        config = Config.load(args.config, overrides_from_args(args))
+        variants = config.estimate.variants()
+
+        assert len(variants) == len(p3g_matchcount.columns())
+        assert {(v.max_matches, v.match_selection.value) for v in variants} == set(
+            p3g_matchcount.columns()
+        )
+        assert {v.method.value for v in variants} == {p3g_matchcount.ESTIMATOR}
+        assert {v.threshold_px for v in variants} == {p3g_matchcount.THRESHOLD}
+        assert {v.warp_model.value for v in variants} == {p3g_matchcount.WARP_MODEL}
+        assert config.preprocess.input_scale == p3g_matchcount.INPUT_SCALE
+        assert list(config.match.matchers) == list(stages.REDUCED_8)
+
+    def test_the_ladder_bites_every_matcher_and_none_of_it_is_below_a_minimal_sample(
+        self,
+    ) -> None:
+        """**Why nine levels and not GRID.md's frozen six.** `sift`'s measured yield is 46.3 on
+        `flir` and 32.1 on `dronevehicle`, so a ladder stopping at 64 is inert for it in every
+        column and one of reduced-8 reproduces the anchor throughout. Three responsive caps per
+        matcher is the bar; the floor is 4, below which a homography has no minimal sample."""
+        capped = [cap for cap in p3g_matchcount.CAPS if cap != 0]
+        assert min(capped) >= 4
+        assert capped == sorted(capped, reverse=True)
+        for dataset, yields in p3g_matchcount.MEASURED_YIELD.items():
+            for matcher, supply in yields.items():
+                biting = [cap for cap in capped if cap < supply]
+                assert len(biting) >= 3, f"{dataset}/{matcher} responds at {biting}"
+        # The frozen ladder, stated as the thing this one replaces rather than left implicit.
+        sift = min(p3g_matchcount.MEASURED_YIELD[d]["sift"] for d in p3g_matchcount.DATASETS)
+        assert sift < 64, "a six-level ladder stopping at 64 would leave sift at its anchor"
+
+    def test_every_matcher_in_the_yield_table_is_one_the_stage_runs(self) -> None:
+        """`MEASURED_YIELD` is divided by (block 2's `knee/yield`) and read as the reason the
+        ladder is what it is, so a name that drifts out of `reduced-8` would put a fraction in
+        the console against a matcher no column has."""
+        for dataset, yields in p3g_matchcount.MEASURED_YIELD.items():
+            assert dataset in p3g_matchcount.DATASETS
+            assert set(yields) == set(stages.REDUCED_8)
+
+    def test_the_sweep_hashes_apart_from_the_uncapped_anchor(self) -> None:
+        """P3-12c F76, in the form `refuse_a_stale_run` consumes it. `max_matches` is dropped
+        from the hash payload at `0` and `match_selection` at `confidence`, so this stage's
+        anchor cell resolves to the digest every stage A-F directory already carries -- and the
+        swept config hashes apart, which is what stops stage E's rows being resumed into this
+        stage's directory and printed under its banner.
+
+        The **relation** is asserted and never the values: the digest is platform-dependent
+        (F64), so a number pinned here would fail on the server."""
+        cell = next(c for c in stages.CELLS if c.dataset == "dronevehicle")
+        swept = p3g_matchcount.argv_for(cell)
+        anchor = _drop_flags(swept, ("--sweep-max-matches", "--sweep-selections"))
+        pre_axis = _drop_flags(anchor, ("--max-matches", "--match-selection"))
+        assert stages.intended_hash(anchor) == stages.intended_hash(pre_axis)
+        assert stages.intended_hash(swept) != stages.intended_hash(anchor)
+
+    def test_the_run_argv_is_the_scientific_argv_plus_the_invocation(self) -> None:
+        """The split exists so the tests above resolve the very config the run used. If `run`
+        ever adds a scientific flag of its own, they would be checking a config nothing ran."""
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        scientific = p3g_matchcount.argv_for(cell)
+        assert _stage_g_argv(cell)[: len(scientific)] == scientific
+
+    def test_a_cap_above_the_yield_is_marked_as_the_anchor_reproduced(self) -> None:
+        """F74 made visible in the deliverable. Without the `=` marker the wide columns read as
+        a suspiciously flat result instead of the correctness property they are."""
+        series, rows = _g_cells("roma", n_matches=50)
+        cell = next(c for c in stages.CELLS if c.dataset == "flir")
+        table = p3g_matchcount.count_table(cell, series, rows, p3g_matchcount.HEADLINE)
+        lines = {line.split()[0]: line for line in table.splitlines() if line[:1].isalnum()}
+        # 50 matches: 64 and above cannot bite, 32 and below do.
+        assert lines["64/conf"].rstrip().endswith("=")
+        assert not lines["32/conf"].rstrip().endswith("=")
+
+    def test_the_integrity_block_catches_an_inert_cap_that_moved(self) -> None:
+        """**The oracle for this stage's silent failure.** An inert cap must return the identical
+        homography, not a permutation of the same correspondences fitted again -- `h` is compared
+        exactly because OpenCV's solvers carry no RNG state between calls."""
+        _, rows = _g_cells("roma", n_matches=50)
+        assert "PASS" in p3g_matchcount.integrity_block({"flir": rows})
+        moved = dict(rows)
+        moved[(64, "confidence", "roma")] = [
+            _g_row("a", "roma", 64, "confidence", n_matches=50, corner_err=9.0)
+        ]
+        block = p3g_matchcount.integrity_block({"flir": moved})
+        assert "FAIL" in block
+        assert "does not reproduce the uncapped fit" in block
+
+    def test_the_integrity_block_catches_a_ratio_taken_over_the_wrong_denominator(self) -> None:
+        """F77: `inlier_ratio` is inliers over `n_selected` and `n_matches` deliberately did not
+        move, so a capped row's ratio is only reproducible from the file if the right
+        denominator was used. Nothing downstream would notice if it were not."""
+        _, rows = _g_cells("roma", n_matches=50)
+        broken = dict(rows)
+        row = rows[(32, "random", "roma")][0]
+        broken[(32, "random", "roma")] = [
+            _g_row("a", "roma", 32, "random", n_matches=50, inlier_ratio=row.n_inliers / 50)
+        ]
+        assert "FAIL" in p3g_matchcount.integrity_block({"flir": broken})
+
+    def test_the_confidence_hole_is_a_named_row_and_not_a_departure(self) -> None:
+        """`xfeat` scores no matches (P0-2), so a confidence-ranked cap is undefined for it. The
+        cells are recorded (X-4) and must not be read as "departs at the widest cap", which is
+        what a knee computed off a NaN would say."""
+        series, rows = _g_cells("xfeat", n_matches=50, hole=True)
+        assert "xfeat" in p3g_matchcount.hole_block({"flir": rows})
+        block = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        confidence = next(
+            line for line in block.splitlines() if "xfeat" in line and "confidence" in line
+        )
+        assert "hole" in confidence
+        # The random arm is defined for it and is the reason the axis still covers all eight.
+        random_arm = next(
+            line for line in block.splitlines() if "xfeat" in line and "random" in line
+        )
+        assert "hole" not in random_arm
+
+    def test_the_knee_is_the_narrowest_cap_that_holds_all_the_way_down(self) -> None:
+        """A cap that scores well *below* a departure is not promoted. Stage F's F69 is one such
+        cell -- its `mace` beat every neighbour by 40% while its median barely moved -- and a
+        knee read off a single comparison would have believed it."""
+        lucky = {0: 5.0, 1024: 5.0, 512: 5.0, 256: 5.0, 128: 5.0, 64: 9.0, 32: 5.0, 16: 20.0}
+        series, rows = _g_cells("roma", n_matches=4096, mace=lucky)
+        block = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        row = next(line for line in block.splitlines() if "confidence" in line and "roma" in line)
+        assert row.split()[-3] == "128"
+
+    def test_a_knee_that_never_bit_is_named_rather_than_quoted_as_a_fraction(self) -> None:
+        """A knee wider than the matcher's yield is not a decimation fraction: it says the
+        matcher departs as soon as the cap does anything. `sift` on `flir` yields 46, so a knee
+        of 64 would print 1.382 -- "safe to decimate to 138%" -- and the honest answer is that
+        no real cap held. Decided per pair off the rows, not off the mean yield."""
+        held = dict.fromkeys(p3g_matchcount.CAPS, 5.0) | {32: 50.0, 16: 60.0, 8: 70.0}
+        series, rows = _g_cells("sift", n_matches=50, mace=held)
+        block = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        row = next(line for line in block.splitlines() if "confidence" in line and "sift" in line)
+        assert row.split()[-3] == "64"
+        assert row.split()[-1] == "inert"
+
+    def test_a_median_over_arms_is_not_shifted_by_a_matcher_only_one_of_them_solved(self) -> None:
+        """Stage D's F37, one axis over. A median over two matchers in one arm against one
+        matcher in the other compares two populations, and dropping the second-worst matcher
+        lifts a median enough to invert an ordering."""
+        series, rows = _g_cells("roma", n_matches=4096, mace=5.0)
+        lost, lost_rows = _g_cells("eloftr", n_matches=800, mace=40.0)
+        lost[(64, "confidence", "eloftr")] = [_g_metrics(float("nan"))]
+        series |= lost
+        rows |= lost_rows
+        block = p3g_matchcount.ordering_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        at_64 = next(
+            line for line in block.splitlines() if line.startswith("flir") and " 64" in line
+        )
+        # Only `roma` survives at that cap, so both arms read its value and the delta is zero.
+        assert at_64.split()[2] == "1"
+        assert at_64.split()[3] == "5.00"
+
+
+def _drop_flags(argv: list[str], flags: tuple[str, ...]) -> list[str]:
+    """`argv` without those flags and the value each carries."""
+    out: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token in flags:
+            skip = True
+            continue
+        out.append(token)
+    return out
+
+
+def _stage_g_argv(cell: stages.Cell) -> list[str]:
+    """The argv `p3g_matchcount.run` would build, captured without running anything."""
+    captured: list[list[str]] = []
+    original = p3g_matchcount.run_cell
+    p3g_matchcount.run_cell = lambda _cell, _dir, argv, _banner: captured.append(argv) or True
+    try:
+        p3g_matchcount.run(cell, "cpu", stages.DryRun(wandb=False))
+    finally:
+        p3g_matchcount.run_cell = original
+    return captured[0]
+
+
+def _g_metrics(mace: float, *, ratio: float = 0.8) -> dict[str, float]:
+    return {
+        p3g_matchcount.HEADLINE: mace,
+        EPE_MEDIAN: 1.0,
+        p3g_matchcount.SECONDARY: 0.5,
+        FAILURE_RATE: 0.0,
+        MATCH_INLIER_RATIO: ratio,
+        TIME_ESTIMATE_MS: 1.0,
+        "reg/n_pairs": 300.0,
+    }
+
+
+def _g_row(
+    stem: str,
+    matcher: str,
+    cap: int,
+    selection: str,
+    *,
+    n_matches: int,
+    n_inliers: int = 40,
+    corner_err: float = 2.0,
+    inlier_ratio: float | None = None,
+) -> PairRow:
+    """One row with `n_selected` and `inlier_ratio` kept consistent with the cap (F77)."""
+    n_selected = n_matches if cap == 0 else min(cap, n_matches)
+    inliers = min(n_inliers, n_selected)
+    return make_row(
+        stem,
+        matcher=matcher,
+        max_matches=cap,
+        match_selection=selection,
+        n_matches=n_matches,
+        n_selected=n_selected,
+        n_inliers=inliers,
+        inlier_ratio=inliers / n_selected if inlier_ratio is None else inlier_ratio,
+        corner_err=corner_err,
+    )
+
+
+def _g_cells(
+    matcher: str,
+    *,
+    n_matches: int,
+    mace: float | dict[int, float] = 5.0,
+    hole: bool = False,
+) -> tuple[p3g_matchcount.Series, p3g_matchcount.Rows]:
+    """One matcher's seventeen cells. `hole=True` makes the confidence arm the `xfeat` case."""
+    series: p3g_matchcount.Series = {}
+    rows: p3g_matchcount.Rows = {}
+    for cap, selection in p3g_matchcount.columns():
+        key = (cap, selection, matcher)
+        blocked = hole and cap != 0 and selection == "confidence"
+        value = mace.get(cap, float("nan")) if isinstance(mace, dict) else mace
+        series[key] = [_g_metrics(float("nan") if blocked else value)]
+        if blocked:
+            rows[key] = [
+                make_row(
+                    "a",
+                    matcher=matcher,
+                    success=False,
+                    max_matches=cap,
+                    match_selection=selection,
+                    failure_reason=p3g_matchcount.NEEDS_CONFIDENCE,
+                    n_matches=n_matches,
+                    n_selected=0,
+                    n_inliers=0,
+                    inlier_ratio=0.0,
+                )
+            ]
+        else:
+            rows[key] = [_g_row("a", matcher, cap, selection, n_matches=n_matches)]
+    return series, rows

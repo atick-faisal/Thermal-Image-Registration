@@ -219,7 +219,7 @@ the only aerial one.
 | D | 4 estimators x threshold 1/3/5 px | reduced-8 | driving+aerial | 24 (**10 match passes**) | **5** | P3-10 |
 | E | 3 warp models x {magsac, **ransac control**} (**TPS, H+flow → P3-4b**) | reduced-8 | driving+aerial | 6 (**2 match passes**) | 1 | P3-11 |
 | **F** | input resolution ×1 / ×0.75 / ×0.5 / ×0.25 (**both sides**) + a `flir` mono-modal floor column | reduced-8 | driving+aerial | **12 (12 match passes)** | 1 | P3-12 (axis **P3-12a**, driver **P3-12b**, **ran 2026-09-02**) |
-| **F′** | match count × {confidence, random} (**downstream**) | reduced-8 | driving+aerial | **13 (2 match passes)** | 1 | P3-12c (axis **P3-12c-a**, driver **P3-12c-b**) |
+| **F′** | match count × {confidence, random} (**downstream**), caps 1024→8 | reduced-8 | driving+aerial | **17 (2 match passes)** | 1 | P3-12c (axis **P3-12c-a**, driver **P3-12c-b**, authored 2026-09-02) |
 | G | blur / noise / JPEG / FOV overlap x severity | reduced-8 | driving+aerial | ~40 | 1 | P3-13 |
 
 A "cell" is one `cmreg bench` invocation over 300 pairs with its full matcher list.
@@ -641,19 +641,49 @@ identically and the uncapped column collapses to one cell — the same collapse 
 column has, taken in `EstimateConfig.variants()` because these are variants of one run and a
 duplicate would double-count the anchor in every aggregate.
 
-**Choosing the caps is the driver's open question and is not free.** A cap above a matcher's yield
-is inert by construction — it must be, or the axis's widest columns would differ from the anchor
-by a reordering rather than by a count — and reduced-8's yields span two orders of magnitude
-(P0-2: `minima-roma` 10 000 against `sift-nn` 113 on one pair). One absolute ladder is therefore
-inert at the top for the sparse arm and never reaches the anchor for the dense one. A per-matcher
-fraction is the alternative and is a *different measurement*: absolute caps measure a fixed
-correspondence budget, fractions measure decimation. Settle it in the driver, with stage A's own
-`match/total` column in hand.
+**The caps were the driver's open question and P3-12c-b closed it: absolute, nine levels.**
+Settled against stage A's own `match/total` column, which is what that question asked for. The
+measured means over 300 val pairs:
+
+| | `roma` | `minima-roma` | `matchanything-roma` | `xoftr` | `xfeat` | `eloftr` | `superpoint-lightglue` | `sift` |
+|---|---|---|---|---|---|---|---|---|
+| `flir` | 4096 | 10000 | 4990 | 1613 | 798 | 790 | 351 | **46.3** |
+| `dronevehicle` | 4096 | 10000 | 4991 | 1478 | 783 | 595 | 318 | **32.1** |
+
+Absolute over per-matcher fraction, on four counts. It is what P3-12c-a implements —
+`sweep_max_matches` is a descending int tuple with a validator to match, so fractions reopen the
+axis for a new field, a new validator and a sixth `config_hash` exemption before anything runs.
+**The fraction is recoverable from the table and the reverse is not**: `match/total` is a column
+on every row, so `cap / yield` reads off the file, and block 2 of the driver prints exactly that
+ratio. A cap above a matcher's yield is the anchor *by construction* (F74), so an inert column is
+a correctness property rather than a defect — and the cap at which each matcher **departs** from
+its own anchor is the finding. And only at equal absolute budget does the confidence-vs-random
+control compare across matchers; at equal fraction each column is a different number of
+correspondences and the comparison is readable only within a row.
+
+**Nine levels — 0, 1024, 512, 256, 128, 64, 32, 16, 8 — hence seventeen cells, not thirteen.**
+`sift`'s *measured* yield is 46.3 / 32.1, not P0-2's 113 (which was one pair), so the six-level
+ladder this section previously implied would leave `sift` at its anchor in every column and make
+one of reduced-8 an all-anchor row. At nine levels every matcher has at least three responsive
+caps, and the 16/8 end walks the fit down to near its 4-point minimal sample — the regime P4-6
+needs a figure of. Cost: ~15 min against thirteen cells.
 
 **Two inherited reporting rules, both non-optional here.** `reg/epe_median` prints beside
 `reg/mace`, because a cap is precisely the kind of change that shifts the whole distribution by an
 amount a mean over successes cannot resolve (stage F's F63); and the aggregate blocks render once
 per metric over the matchers every column solved (F34, F37).
+
+**`scripts/p3g_matchcount.py` is the driver and landed as P3-12c-b** (2026-09-02), carrying six
+blocks: the deliverable table once per metric; the **knee** (the narrowest cap each matcher holds
+its own anchor at, quoted beside `knee / yield`); the **confidence-vs-random** control at equal
+cap, which is PLAN.md §6.2's certainty-map baseline probed off an ablation that had to run anyway;
+an **integrity** block asserting F74 and F77 per row; the `selection_needs_confidence` hole; and
+`time/estimate_ms` by cap.
+
+**Its tables are transposed relative to stages D–F** — caps read down, matchers across. Seventeen
+columns the other way round is a ~240-character line, and the console reaches the Mac by
+copy-paste through a wrapped terminal. Down is also where a sweep belongs: monotonicity in the
+axis reads as monotonicity in the column.
 
 Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
 listed to fix its shape, not to be launched.
@@ -683,6 +713,8 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | C | reduced-8 / responsive-4, 7,800 | **4 h 34 min wall clock, measured** (26 cells, 2026-08-29) against ~3.5 h projected from matcher time — ratio **1.31**, inside stage B's 1.38–1.58 band, so the per-cell overhead correction now holds on a second stage. Upsampling does raise the bill, but far less than the pixel count suggests: on GPU every backend rises only ×1.23–×3.62 across ×1–×4, because what scales is the fixed per-pair pipeline and not the matching (P3-9 F28) |
 | E | reduced-8, 28,800 rows off 4,800 matches | **~1.1 h, measured** (2026-08-31; the `dronevehicle` swept pass ran **31 min 54 s**) against ~1.5-1.8 h projected. Rewritten from the run's own `time/estimate_ms` as this row said it should be. One pass is **12.2 min matching + the anchor estimate**, **6.5 min** estimating the other five variants and **~13 min** scoring them (~2.6 min per variant, against stage D's ~2.1). **Vanilla RANSAC was 19% of the bill, not the ~half projected** — 6.14 min, of which **5.50 min is `homography/ransac` alone**, i.e. 90% of the control column went to the one cell that had MAGSAC available anyway. The projection priced every RANSAC variant at stage D's ~8 min; that is right for a 4-point minimal set and wrong by 10-20x for a 3- or 2-point one, because RANSAC's iteration count goes as `w^-m` in the model's DoF (P3-11 F49). **Budget a restricted-model RANSAC variant at a small fraction of the homography's, and scale it by the matcher's inlier ratio** |
 | D | reduced-8, 288,000 rows off 24,000 matches | **~11 h 10 min, measured** (2026-08-31; 60 min 38 s per `flir` pass, 71–74 min per `dronevehicle` one) against **~4–5 h projected**. The collapse to **10 match passes** was still right — the frozen 120 invocations were ~38 h — but it won ~3.5×, not ~8×: **a swept pass costs ~3.8 single-variant cells**, because the twelve variants are twelve estimate-*and-score* cycles and not twelve `cv2.findHomography` calls. One `dronevehicle` pass is ~13 min matching, ~30 min estimation (~24 of it vanilla RANSAC alone), ~25 min scoring 28,800 rows, ~2 min Parquet and 96 W&B runs. Budget any future stage that sweeps a *scoring* axis at that ratio. Read the estimator's own bill off `time/estimate_ms`, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
+
+| F′ | reduced-8, 81,600 rows off 4,800 matches | **~2 h projected** (not yet run). Per dataset: ~13 min matching, ~10 min estimation and ~35 min scoring 40,800 rows. Estimation is priced *below* stage E's, not above: every variant is MAGSAC @ 3 px and a **capped** fit is cheaper than an uncapped one, since MAGSAC's per-iteration cost goes with the correspondence count. Scoring is the bill, at stage D's measured ~2.1–2.6 min per variant. 136 W&B runs per dataset |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget

@@ -19,6 +19,13 @@ Server runs come back as console text only. Save each one to
 `logs/<YYYY-MM-DD>-<task>-<what-ran>.txt` — `logs/` is git-ignored, and a log left in the
 repository root stamps every subsequent run's `git_sha` with `-untracked`.
 
+**Paste the log unfiltered.** Stage F′'s arrived with the timestamped INFO lines and the W&B
+lines stripped for readability, and those are the *only* record of two things the analysis
+wants: the run's **wall clock** (recoverable from nothing else — the `time/*` metrics are
+per-pair means and miss loading, scoring and Parquet) and the **W&B group names** that satisfy
+X-1. Both were lost for that stage. The `=== CMREG … ===` blocks are the deliverable, but the
+noise around them is evidence.
+
 ## House style
 
 Adopted wholesale from `../Thermal-To-Optical-Translation/PLAN.md` §13.

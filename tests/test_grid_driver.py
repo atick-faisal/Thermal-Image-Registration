@@ -1120,6 +1120,41 @@ class TestStageG:
         assert row.split()[-3] == "64"
         assert row.split()[-1] == "inert"
 
+    def test_a_knee_set_by_the_tail_of_the_count_distribution_is_starred(self) -> None:
+        """F91. `inert` covers only the cap that bit *nothing*. The real run never reached it:
+        `sift` on `flir` yields 46 **on average** and a cap of 64 still bites the pairs above
+        that mean, so the cell is not inert and 1.382 printed bare -- the exact "decimate to
+        138%" reading the marker exists to prevent. A knee above the mean yield is set by the
+        tail, and the star says the number is not a decimation fraction."""
+        held = dict.fromkeys(p3g_matchcount.CAPS, 5.0) | {32: 50.0, 16: 60.0, 8: 70.0}
+        series, rows = _g_cells("sift", n_matches=(20, 120), mace=held)
+        block = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        row = next(line for line in block.splitlines() if "confidence" in line and "sift" in line)
+        assert row.split()[-3] == "64"
+        assert row.split()[-1] == "1.382*"
+
+    def test_a_zero_anchor_has_no_knee_because_the_band_around_it_is_degenerate(self) -> None:
+        """F92. The band is *relative*, so an anchor of 0.0 admits every cap: `dronevehicle`'s
+        `sift` never succeeds at 10 px and the block read that as "holds all the way to 8".
+        There is no anchor to preserve, and saying so is not the same as saying 8 matches
+        suffice."""
+        series, rows = _g_cells("sift", n_matches=50, secondary=0.0)
+        block = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.SECONDARY
+        )
+        row = next(line for line in block.splitlines() if "confidence" in line and "sift" in line)
+        assert row.split()[-3] == "n/a"
+        # The same cells keep a real knee on a metric whose anchor is not degenerate.
+        headline = p3g_matchcount.departure_block(
+            {"flir": series}, {"flir": rows}, p3g_matchcount.HEADLINE
+        )
+        other = next(
+            line for line in headline.splitlines() if "confidence" in line and "sift" in line
+        )
+        assert other.split()[-3] == "8"
+
     def test_a_median_over_arms_is_not_shifted_by_a_matcher_only_one_of_them_solved(self) -> None:
         """Stage D's F37, one axis over. A median over two matchers in one arm against one
         matcher in the other compares two populations, and dropping the second-worst matcher
@@ -1167,11 +1202,11 @@ def _stage_g_argv(cell: stages.Cell) -> list[str]:
     return captured[0]
 
 
-def _g_metrics(mace: float, *, ratio: float = 0.8) -> dict[str, float]:
+def _g_metrics(mace: float, *, ratio: float = 0.8, secondary: float = 0.5) -> dict[str, float]:
     return {
         p3g_matchcount.HEADLINE: mace,
         EPE_MEDIAN: 1.0,
-        p3g_matchcount.SECONDARY: 0.5,
+        p3g_matchcount.SECONDARY: secondary,
         FAILURE_RATE: 0.0,
         MATCH_INLIER_RATIO: ratio,
         TIME_ESTIMATE_MS: 1.0,
@@ -1209,18 +1244,24 @@ def _g_row(
 def _g_cells(
     matcher: str,
     *,
-    n_matches: int,
+    n_matches: int | tuple[int, ...],
     mace: float | dict[int, float] = 5.0,
+    secondary: float = 0.5,
     hole: bool = False,
 ) -> tuple[p3g_matchcount.Series, p3g_matchcount.Rows]:
-    """One matcher's seventeen cells. `hole=True` makes the confidence arm the `xfeat` case."""
+    """One matcher's seventeen cells. `hole=True` makes the confidence arm the `xfeat` case.
+
+    `n_matches` takes a tuple to give the pairs *different* yields, which is the only way to
+    reach a cap that bites some of them and not others -- the case the mean yield cannot see.
+    """
+    counts = (n_matches,) if isinstance(n_matches, int) else n_matches
     series: p3g_matchcount.Series = {}
     rows: p3g_matchcount.Rows = {}
     for cap, selection in p3g_matchcount.columns():
         key = (cap, selection, matcher)
         blocked = hole and cap != 0 and selection == "confidence"
         value = mace.get(cap, float("nan")) if isinstance(mace, dict) else mace
-        series[key] = [_g_metrics(float("nan") if blocked else value)]
+        series[key] = [_g_metrics(float("nan") if blocked else value, secondary=secondary)]
         if blocked:
             rows[key] = [
                 make_row(
@@ -1230,12 +1271,15 @@ def _g_cells(
                     max_matches=cap,
                     match_selection=selection,
                     failure_reason=p3g_matchcount.NEEDS_CONFIDENCE,
-                    n_matches=n_matches,
+                    n_matches=counts[0],
                     n_selected=0,
                     n_inliers=0,
                     inlier_ratio=0.0,
                 )
             ]
         else:
-            rows[key] = [_g_row("a", matcher, cap, selection, n_matches=n_matches)]
+            rows[key] = [
+                _g_row(f"p{i}", matcher, cap, selection, n_matches=count)
+                for i, count in enumerate(counts)
+            ]
     return series, rows

@@ -563,19 +563,23 @@ def _knee(series: Series, rows: Rows, selection: str, matcher: str, metric: str)
 def _ratio_text(
     rows: Rows, yields: dict[str, float], knee: int | None, selection: str, matcher: str
 ) -> str:
-    """`knee / yield`, or `inert` when the knee is a cap that never bit.
+    """`knee / yield`, `inert` when the knee never bit, a trailing `*` when it bit only the tail.
 
-    A knee wider than the matcher's yield is not a decimation fraction at all -- it is the
-    statement that the matcher departs as soon as the cap does anything, and printing 1.382 for
-    it would read as "safe to decimate to 138%". Decided on `_inert`, which is per pair, rather
-    than on `knee > yield`, which is a mean over pairs and settles nothing about any of them.
+    A knee wider than the matcher's yield is not a decimation fraction, and there are two ways
+    to be wider that are different facts. `inert`: the cap dropped nothing on *any* pair, so the
+    matcher departs the moment the cap does anything. `*`: the cap bit on some pairs and not
+    others, because `yields` is a **mean** and the count distribution has a tail above it -- the
+    knee is then set by that tail and the number is not a fraction anything was decimated to.
+    Both are decided off the rows; the real run reached only the second (F91).
     """
     if knee is None:
         return "--"
     if _inert(rows, (knee, selection, matcher)):
         return "inert"
     supply = yields.get(matcher)
-    return f"{knee / supply:.3f}" if supply else "?"
+    if not supply:
+        return "?"
+    return f"{knee / supply:.3f}" + ("*" if knee > supply else "")
 
 
 def departure_block(all_series: dict[str, Series], all_rows: dict[str, Rows], metric: str) -> str:
@@ -601,11 +605,12 @@ def departure_block(all_series: dict[str, Series], all_rows: dict[str, Rows], me
         "# knee/yield is cap over the matcher's mean stage-A match/total: the decimation fraction,",
         "#   recovered from an absolute ladder (which the reverse could not do). `?` where this",
         "#   run's matcher has no stage-A yield (a dry-run override).",
-        "# `inert` there means the knee is a cap that dropped nothing on any pair, i.e. THIS "
-        "matcher",
-        "#   departs as soon as the cap actually bites. Read off the rows, not off the mean "
-        "yield --",
-        "#   a ratio above 1.0 would otherwise read as 'safe to decimate to 138%'.",
+        "# `inert` there = the knee dropped nothing on ANY pair, so this matcher departs the",
+        "#   moment the cap bites. A trailing `*` = the knee is above the matcher's MEAN yield",
+        "#   yet still bit, so it is set by the TAIL of the count distribution and the number is",
+        "#   not a fraction anything was decimated to. Both are read off the rows, not the mean.",
+        "# `n/a` = the anchor is 0, so a relative band around it is degenerate and every cap",
+        "#   trivially holds. It says the matcher never succeeded, not that 8 matches suffice.",
     ]
     header = (
         f"{'dataset':<14}{'ordering':<12}{'matcher':<22}"
@@ -618,7 +623,13 @@ def departure_block(all_series: dict[str, Series], all_rows: dict[str, Rows], me
         for selection in SELECTIONS:
             for matcher in _matchers_in(series):
                 anchor = _metric(series, (ANCHOR[0], ANCHOR[1], matcher), metric)
-                if any(_is_hole(rows, (cap, selection, matcher)) for cap in CAPS if cap != 0):
+                if anchor == 0.0:
+                    # A relative band around zero is degenerate -- 0 x 1.05 is 0 -- so nothing
+                    # can depart and the knee reads as the narrowest cap on the ladder.
+                    # `dronevehicle`/`sift` never succeeds at 10 px, and "needs only 8" is the
+                    # wrong reading of a row that has no anchor to preserve (F92).
+                    knee_text, ratio_text = "n/a", "--"
+                elif any(_is_hole(rows, (cap, selection, matcher)) for cap in CAPS if cap != 0):
                     knee_text, ratio_text = "hole", "--"
                 else:
                     knee = _knee(series, rows, selection, matcher, metric)

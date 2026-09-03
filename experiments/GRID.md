@@ -685,6 +685,24 @@ columns the other way round is a ~240-character line, and the console reaches th
 copy-paste through a wrapped terminal. Down is also where a sweep belongs: monotonicity in the
 axis reads as monotonicity in the column.
 
+**The stage ran 2026-09-03 and its two results are P3-12c F85 and F86.** The knee is **64–512
+absolute**, two orders of magnitude above the four-point minimal sample, and it is **0.006–1.3 as
+a fraction** — so the decimation fraction is not a matcher-independent constant, which is the
+retrospective case for the absolute ladder rather than a restatement of it. And the
+confidence-vs-random control did *not* come back flat: `confidence` raises `match/inlier_ratio`
+on all sixteen (dataset × cap) cells and worsens `reg/epe_median` on all sixteen. **The certainty
+map is worse than a seeded prefix**, which is the §6.2 baseline result, and it is simultaneously
+a controlled demonstration that the inlier ratio is gameable — one bit changed, the GT-free
+metric up and the true error worse — which §6.4 and P4-2 have to quote.
+
+Two rendering defects the run exposed and the Mac dry run structurally could not, both fixed and
+re-rendering free through `run_cell`'s resume path. `knee/yield` above 1.0 has **two** causes and
+only one was marked: a cap that bit nothing (`inert`) and a cap above the matcher's *mean* yield
+that still bit its tail, now a trailing `*`. And the departure band is relative, so a **zero
+anchor** admits every cap — `dronevehicle`/`sift` never succeeds at 10 px and the block read that
+as "holds all the way to 8"; it prints `n/a`, and the knee column is meaningful only where the
+anchor is.
+
 Stage G still has unmet preconditions (P2-2's overlap generator, P2-3's degradations) and is
 listed to fix its shape, not to be launched.
 
@@ -714,7 +732,7 @@ and finalising the W&B run are charged **per cell rather than per pair** (P3-8's
 | E | reduced-8, 28,800 rows off 4,800 matches | **~1.1 h, measured** (2026-08-31; the `dronevehicle` swept pass ran **31 min 54 s**) against ~1.5-1.8 h projected. Rewritten from the run's own `time/estimate_ms` as this row said it should be. One pass is **12.2 min matching + the anchor estimate**, **6.5 min** estimating the other five variants and **~13 min** scoring them (~2.6 min per variant, against stage D's ~2.1). **Vanilla RANSAC was 19% of the bill, not the ~half projected** — 6.14 min, of which **5.50 min is `homography/ransac` alone**, i.e. 90% of the control column went to the one cell that had MAGSAC available anyway. The projection priced every RANSAC variant at stage D's ~8 min; that is right for a 4-point minimal set and wrong by 10-20x for a 3- or 2-point one, because RANSAC's iteration count goes as `w^-m` in the model's DoF (P3-11 F49). **Budget a restricted-model RANSAC variant at a small fraction of the homography's, and scale it by the matcher's inlier ratio** |
 | D | reduced-8, 288,000 rows off 24,000 matches | **~11 h 10 min, measured** (2026-08-31; 60 min 38 s per `flir` pass, 71–74 min per `dronevehicle` one) against **~4–5 h projected**. The collapse to **10 match passes** was still right — the frozen 120 invocations were ~38 h — but it won ~3.5×, not ~8×: **a swept pass costs ~3.8 single-variant cells**, because the twelve variants are twelve estimate-*and-score* cycles and not twelve `cv2.findHomography` calls. One `dronevehicle` pass is ~13 min matching, ~30 min estimation (~24 of it vanilla RANSAC alone), ~25 min scoring 28,800 rows, ~2 min Parquet and 96 W&B runs. Budget any future stage that sweeps a *scoring* axis at that ratio. Read the estimator's own bill off `time/estimate_ms`, never off `time/total_ms`, which every one of a pair's twelve rows charges the full match to |
 
-| F′ | reduced-8, 81,600 rows off 4,800 matches | **~2 h projected** (not yet run). Per dataset: ~13 min matching, ~10 min estimation and ~35 min scoring 40,800 rows. Estimation is priced *below* stage E's, not above: every variant is MAGSAC @ 3 px and a **capped** fit is cheaper than an uncapped one, since MAGSAC's per-iteration cost goes with the correspondence count. Scoring is the bill, at stage D's measured ~2.1–2.6 min per variant. 136 W&B runs per dataset |
+| F′ | reduced-8, 81,600 rows off 4,800 matches | **matching 11.6 / 12.4 min and estimation 1.7 / 2.6 min, measured** (2026-09-03, `flir` / `dronevehicle`, summed off the run's own `time/match_ms` and `time/estimate_ms`); wall clock not captured. Matching landed on its ~13 min projection and **estimation came in 4–6× under its ~10 min one**, so a swept *estimation* axis is not stage D's ~3.8-cells-per-pass when the variants are cheaper than the anchor: sixteen of the seventeen are capped, and MAGSAC's cost falls **faster** than the correspondence count (`roma`/`flir` 8.88 ms uncapped at 4,096 → 1.15 at 128 → 0.72 at 8, the last four halvings buying 0.4 ms against a fixed floor). The uncapped anchor alone is ~29% of each matcher's estimation bill. **Budget a matcher's estimation off its inlier ratio, not its match count** — `xfeat` costs 16.81 ms on ~798 matches at ratio ~0.16 while `roma` costs 8.88 on 4,096 at 0.82, which is F49's `w^-m` on the matcher axis instead of the model axis. None of it is a pipeline lever: estimation is 1–4% of `time/total_ms`. 136 W&B runs per dataset |
 
 Resolution is the only variable that moves the per-*pair* cost materially -- three 640-wide sets
 sit within 4% of each other and the one 1280-wide set costs 45% more. A fifth dataset's budget
